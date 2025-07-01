@@ -1,0 +1,288 @@
+import subprocess
+import yaml
+import json
+import re
+import os
+import shutil
+from langchain_google_genai import ChatGoogleGenerativeAI
+from typing import Tuple, List, Dict, Optional, Callable
+
+# Load configuration
+with open("integration.yml") as f:
+    config = yaml.safe_load(f)
+GEMINI_API_KEY = config["gemini"]["api_key"]
+LOCAL_REPO_DIR = config["repository"]["local_dir"]
+
+def check_maven_available() -> bool:
+    """
+    Check if Maven is available in the system PATH
+    """
+    try:
+        import platform
+        mvn_command = "mvn.cmd" if platform.system() == "Windows" else "mvn"
+        result = subprocess.run([mvn_command, "--version"], capture_output=True, text=True)
+        return result.returncode == 0
+    except Exception:
+        return False
+
+def run_maven_compile(code_dir: str) -> Tuple[bool, str, str]:
+    """
+    Run 'mvn clean compile' and return (success, stdout, stderr)
+    """
+    import platform
+    mvn_command = "mvn.cmd" if platform.system() == "Windows" else "mvn"
+    try:
+        print(f"🔨 Running Maven clean compile in directory: {code_dir}")
+        result = subprocess.run(
+            [mvn_command, "clean", "compile"],
+            cwd=code_dir,
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        return result.returncode == 0, result.stdout, result.stderr
+    except subprocess.TimeoutExpired:
+        return False, "", "Maven compile timed out after 5 minutes"
+    except Exception as e:
+        return False, "", f"Maven compile failed with exception: {str(e)}"
+
+def extract_build_errors(output: str) -> List[Dict]:
+    """
+    Extract meaningful build errors from Maven output (stdout + stderr)
+    """
+    errors = []
+    # Compilation errors
+    compilation_pattern = r'\[ERROR\] (.+\.java):\[(\d+),(\d+)\] (.+)'
+    compilation_matches = re.findall(compilation_pattern, output)
+    for match in compilation_matches:
+        file_path, line, column, error_msg = match
+        errors.append({
+            "type": "compilation",
+            "file": file_path,
+            "line": int(line),
+            "column": int(column),
+            "message": error_msg.strip()
+        })
+    # Dependency issues
+    dependency_pattern = r'\[ERROR\] (.+\.jar) was not found'
+    dependency_matches = re.findall(dependency_pattern, output)
+    for match in dependency_matches:
+        errors.append({
+            "type": "dependency",
+            "message": f"Missing dependency: {match}"
+        })
+    # General Maven errors
+    general_error_pattern = r'\[ERROR\] (.+)'
+    general_matches = re.findall(general_error_pattern, output)
+    for match in general_matches:
+        if match not in [error.get("message", "") for error in errors]:
+            errors.append({
+                "type": "general",
+                "message": match.strip()
+            })
+    return errors
+
+def get_file_content(file_path: str, code_dir: str) -> Optional[str]:
+    """
+    Get the content of a specific file
+    """
+    try:
+        full_path = f"{code_dir}/{file_path}"
+        with open(full_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except Exception as e:
+        print(f"Could not read file {file_path}: {e}")
+        return None
+
+def fix_build_errors(errors: List[Dict], code_dir: str) -> List[Dict]:
+    """
+    Use LLM to fix build errors and return the fixes
+    """
+    if not errors:
+        return []
+    
+    llm = ChatGoogleGenerativeAI(model="gemini-1.5-flash-002", google_api_key=GEMINI_API_KEY)
+    
+    # Collect relevant file contents
+    files_to_fix = set()
+    for error in errors:
+        if error.get("file"):
+            files_to_fix.add(error["file"])
+    
+    file_contents = {}
+    for file_path in files_to_fix:
+        content = get_file_content(file_path, code_dir)
+        if content:
+            file_contents[file_path] = content
+    
+    # Create error summary
+    error_summary = "\n".join([
+        f"- {error['type']}: {error.get('file', 'N/A')}:{error.get('line', 'N/A')} - {error['message']}"
+        for error in errors
+    ])
+    
+    # Create file content summary
+    files_summary = ""
+    for file_path, content in file_contents.items():
+        files_summary += f"\n// FILE: {file_path}\n{content}\n"
+    
+    prompt = (
+        "You are an expert Java developer. The Maven build step is failing with the following errors:\n\n"
+        f"{error_summary}\n\n"
+        "Here are the relevant files that need to be fixed:\n"
+        f"{files_summary}\n\n"
+        "Please fix these build errors. Return ONLY a JSON response with the following format:\n\n"
+        "{\n"
+        "  \"files\": [\n"
+        "    {\n"
+        "      \"path\": \"src/main/java/com/example/Foo.java\",\n"
+        "      \"action\": \"update\",\n"
+        "      \"content\": \"...fixed code...\"\n"
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "IMPORTANT: Always use RELATIVE paths for the 'path' field (relative to the project root). Never use absolute paths.\n"
+        "Focus on:\n"
+        "1. Fixing compilation errors (missing imports, syntax errors, etc.)\n"
+        "2. Resolving dependency issues in pom.xml\n"
+        "3. Ensuring code compiles and runs successfully\n"
+        "DO NOT return markdown, comments, or explanations. Only return the JSON."
+    )
+    
+    try:
+        response = llm.invoke(prompt)
+        raw_output = str(response.content).strip()
+        
+        # Clean up the response
+        if raw_output.startswith("```json"):
+            raw_output = raw_output.lstrip("```json").rstrip("```").strip()
+        elif raw_output.startswith("```"):
+            raw_output = raw_output.lstrip("```").rstrip("```").strip()
+        
+        parsed = json.loads(raw_output)
+        return parsed.get("files", [])
+        
+    except Exception as e:
+        print(f"❌ Failed to get fixes from LLM: {e}")
+        return []
+
+def apply_fixes(fixes: List[Dict], code_dir: str) -> bool:
+    """
+    Apply the fixes returned by the LLM
+    """
+    if not fixes:
+        return False
+    
+    try:
+        for fix in fixes:
+            file_path = os.path.normpath(fix["path"])
+            # Handle absolute/relative paths
+            if not os.path.isabs(file_path):
+                full_path = os.path.abspath(os.path.join(code_dir, file_path))
+            else:
+                full_path = file_path
+            # Ensure file is within project
+            if not full_path.startswith(os.path.abspath(code_dir)):
+                print(f"❌ Refusing to write outside project: {full_path}")
+                continue
+            # Backup before overwrite
+            if os.path.exists(full_path) and fix["action"] in ("update", "delete"):
+                shutil.copy2(full_path, full_path + ".bak")
+            action = fix["action"]
+            content = fix.get("content", "")
+            
+            if action == "update":
+                with open(full_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                print(f"✅ Updated {file_path}")
+            elif action == "create":
+                os.makedirs(os.path.dirname(full_path), exist_ok=True)
+                with open(full_path, 'w', encoding='utf-8') as f:
+                    f.write(content)
+                print(f"✅ Created {file_path}")
+            elif action == "delete":
+                if os.path.exists(full_path):
+                    os.remove(full_path)
+                    print(f"✅ Deleted {file_path}")
+        
+        return True
+    except Exception as e:
+        print(f"❌ Failed to apply fixes: {e}")
+        return False
+
+def fix_and_build(code_dir: str, max_attempts: int = 3, on_success: Optional[Callable]=None) -> Tuple[bool, str]:
+    """
+    Try to build with 'mvn clean compile', auto-fix with LLM if it fails, and call on_success if build passes.
+    """
+    if not check_maven_available():
+        return False, "Maven is not available in the system PATH. Please install Maven and ensure it's in your PATH."
+    for attempt in range(max_attempts):
+        print(f"\n📋 Attempt {attempt + 1}/{max_attempts}")
+        build_success, stdout, stderr = run_maven_compile(code_dir)
+        output = stdout + "\n" + stderr
+        if build_success:
+            print("✅ Build (mvn clean compile) successful!")
+            if on_success:
+                on_success()
+            return True, output
+        else:
+            print("❌ Build failed. Parsing errors and sending to LLM...")
+            errors = extract_build_errors(output)
+            if errors:
+                fixes = fix_build_errors(errors, code_dir)
+                if fixes:
+                    print(f"🔧 Applying {len(fixes)} fixes...")
+                    if apply_fixes(fixes, code_dir):
+                        print("✅ Fixes applied. Retrying build...")
+                        continue
+                    else:
+                        print("❌ Failed to apply fixes.")
+                        return False, output
+                else:
+                    print("❌ LLM did not generate fixes.")
+                    return False, output
+            else:
+                print("❌ Could not extract specific build errors.")
+                return False, output
+    print("❌ Build failed after max attempts.")
+    return False, output
+
+def run_tests(code_dir: str) -> Tuple[bool, str]:
+    """
+    Run tests and return success status and output
+    """
+    try:
+        print("🧪 Running tests...")
+        result = subprocess.run(
+            ["mvn", "test"], 
+            cwd=code_dir, 
+            capture_output=True, 
+            text=True,
+            timeout=180  # 3 minutes timeout
+        )
+        return result.returncode == 0, result.stdout
+    except subprocess.TimeoutExpired:
+        return False, "Tests timed out after 3 minutes"
+    except Exception as e:
+        return False, f"Test execution failed: {str(e)}"
+
+# def create_and_run_tests(code_dir: str, max_attempts: int = 3) -> Tuple[bool, str]:
+#     """
+#     Main function to build, test, and fix issues automatically using sequential Maven steps
+#     """
+#     return run_sequential_maven_build(code_dir, max_attempts)
+#
+# def verify_build_for_mr(code_dir: str) -> Tuple[bool, str]:
+#     """
+#     Verify build is ready for merge request creation using sequential Maven steps
+#     """
+#     print("🔍 Verifying build for merge request...")
+#     
+#     success, output = run_sequential_maven_build(code_dir)
+#     
+#     if success:
+#         print("✅ Build verification passed - ready for merge request!")
+#         return True, "Build verification successful. Ready to create merge request."
+#     else:
+#         print("❌ Build verification failed - cannot create merge request")
+#         return False, f"Build verification failed:\n{output}"

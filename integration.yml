@@ -1,0 +1,11 @@
+gemini:
+  api_key: <Gemini Key>
+
+gitlab:
+  private_token: <TOKEN>
+  url: "https://gitlab.com"
+  repo_path: "janmejoyparida/employeeapi"
+  default_branch: main
+
+repository:
+  local_dir: ./generated_service
