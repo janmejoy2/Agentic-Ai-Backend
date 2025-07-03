@@ -48,13 +48,13 @@ def apply_structured_changes(file_instructions, repo_dir):
                 f.write(file["content"])
             print(f"Written: {path}")
 
-@app.route('/modernize', methods=['POST'])
+@app.route('/requirement', methods=['POST'])
 def modernize_project():
     try:
         # Get request data
         data = request.get_json()
-        user_req = data.get('requirement')
-        repo_path = data.get('gitlab_repo_url')  # This will now be just the repo path
+        user_req = data.get('requestMessage')
+        repo_path = data.get('githubRepo')  # This will now be just the repo path
         
         if not user_req or not repo_path:
             return jsonify({
