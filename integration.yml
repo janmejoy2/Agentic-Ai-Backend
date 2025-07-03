@@ -1,5 +1,6 @@
 gemini:
   api_key: <Gemini Key>
+  model: "gemini-1.5-flash-002"
 
 gitlab:
   private_token: <TOKEN>

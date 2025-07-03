@@ -1,3 +1,4 @@
+flask
 langchain-google-genai
 python-gitlab
 pyyaml

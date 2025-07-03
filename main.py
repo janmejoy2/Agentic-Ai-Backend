@@ -1,10 +1,12 @@
-from agent1_req_refiner import refine_requirement
-from agent2_code_gen import generate_code
-from agent3_test_gen import fix_and_build
+from agents.agent1_req_refiner import refine_requirement
+from agents.agent2_code_gen import generate_code
+from agents.agent3_test_gen import fix_and_build
 from git_handler import AgenticGitHandler
 from datetime import datetime
 import yaml
 import os
+import git
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 def apply_structured_changes(file_instructions, repo_dir):
     for file in file_instructions:
@@ -20,12 +22,27 @@ def apply_structured_changes(file_instructions, repo_dir):
                 f.write(file["content"])
             print(f"Written: {path}")
 
+with open("integration.yml") as f:
+    config = yaml.safe_load(f)
+
+def generate_mr_description(plan: str, user_req: str) -> str:
+    llm = ChatGoogleGenerativeAI(model=config["gemini"]["model"], google_api_key=config["gemini"]["api_key"])
+    prompt = (
+        "Given the following modernization plan and user requirement, generate a concise, clear merge request description. "
+        "Summarize the plan and briefly describe the main implementation changes. "
+        "Use markdown for readability if appropriate.\n\n"
+        f"User Requirement:\n{user_req}\n\n"
+        f"Modernization Plan:\n{plan}\n"
+    )
+    result = llm.invoke(prompt).content
+    if not isinstance(result, str):
+        result = str(result)
+    return result
+
 if __name__ == "__main__":
     user_req = input("Enter your requirement:\n")
     refined_req = refine_requirement(user_req)
-
-    with open("integration.yml") as f:
-        config = yaml.safe_load(f)
+    mr_description = generate_mr_description(refined_req, user_req)
 
     git_handler = AgenticGitHandler(
         gitlab_url=config["gitlab"]["url"],
@@ -55,18 +72,40 @@ if __name__ == "__main__":
         mr_url = git_handler.create_merge_request(
             branch_name, 
             config["gitlab"]["default_branch"], 
-            "Modernized Code", 
-            "Updated code using agentic AI with comprehensive modernization"
+            user_req,
+            mr_description
         )
         print("🎉 Merge Request created successfully!")
         print("Merge Request URL:", mr_url)
 
     print("🔍 Running build verification and auto-fix with Agent 3...")
-    build_success, build_output = fix_and_build(config["repository"]["local_dir"], max_attempts=3, on_success=create_mr_callback)
+    build_success, build_output = fix_and_build(config["repository"]["local_dir"], max_attempts=10, on_success=create_mr_callback)
     
-    if not build_success:
+    if build_success:
+        # Delete all .bak files before committing
+        for root, dirs, files in os.walk(config["repository"]["local_dir"]):
+            for file in files:
+                if file.endswith('.bak'):
+                    bak_path = os.path.join(root, file)
+                    try:
+                        os.remove(bak_path)
+                        print(f"Deleted backup file: {bak_path}")
+                    except Exception as e:
+                        print(f"Failed to delete backup file {bak_path}: {e}")
+        # Remove any .bak files from git index if they are staged
+        repo = git.Repo(config["repository"]["local_dir"])
+        for root, dirs, files in os.walk(config["repository"]["local_dir"]):
+            for file in files:
+                if file.endswith('.bak'):
+                    bak_path = os.path.relpath(os.path.join(root, file), config["repository"]["local_dir"]).replace(os.sep, '/')
+                    try:
+                        tracked_files = repo.git.ls_files(bak_path)
+                        if tracked_files:
+                            repo.git.rm("--cached", bak_path)
+                    except Exception:
+                        pass
+        print("✅ Build and merge request process completed!")
+    else:
         print("❌ Build verification failed! Merge request not created.")
         print("Build Output:")
         print(build_output)
-    else:
-        print("✅ Build and merge request process completed!")

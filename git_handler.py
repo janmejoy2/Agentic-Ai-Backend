@@ -41,8 +41,19 @@ class AgenticGitHandler:
             else:
                 raise e
 
-        # Exclude app.py, requirements.txt, and target directory
+        # Exclude app.py, requirements.txt, target directory, and .bak files
         repo.git.add(".")
+        # Remove .bak files from git index if any are staged
+        for root, dirs, files in os.walk(self.local_repo_dir):
+            for file in files:
+                if file.endswith('.bak'):
+                    bak_path = os.path.relpath(os.path.join(root, file), self.local_repo_dir).replace(os.sep, '/')
+                    try:
+                        tracked_files = repo.git.ls_files(bak_path)
+                        if tracked_files:
+                            repo.git.rm("--cached", bak_path)
+                    except git.GitCommandError:
+                        pass
         # Handle 'target' directory
         target_path = os.path.join(self.local_repo_dir, "target")
         git_target_path = os.path.relpath(target_path, self.local_repo_dir).replace(os.sep, '/')
