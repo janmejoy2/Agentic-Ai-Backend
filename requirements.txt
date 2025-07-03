@@ -3,3 +3,4 @@ langchain-google-genai
 python-gitlab
 pyyaml
 gitpython
+flask-cors

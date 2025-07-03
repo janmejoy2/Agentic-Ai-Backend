@@ -7,20 +7,21 @@ from datetime import datetime
 import yaml
 import os
 import git
-import tempfile
-import shutil
+from flask_cors import CORS
 
 app = Flask(__name__)
+CORS(app)
+
 
 def generate_mr_description(plan: str, user_req: str) -> str:
     from langchain_google_genai import ChatGoogleGenerativeAI
     # Get the directory where this script is located
     current_dir = os.path.dirname(os.path.abspath(__file__))
     config_path = os.path.join(current_dir, "integration.yml")
-    
+
     with open(config_path) as f:
         config = yaml.safe_load(f)
-    
+
     llm = ChatGoogleGenerativeAI(model=config["gemini"]["model"], google_api_key=config["gemini"]["api_key"])
     prompt = (
         "Given the following modernization plan and user requirement, generate a concise, clear merge request description. "
@@ -33,6 +34,7 @@ def generate_mr_description(plan: str, user_req: str) -> str:
     if not isinstance(result, str):
         result = str(result)
     return result
+
 
 def apply_structured_changes(file_instructions, repo_dir):
     for file in file_instructions:
@@ -48,6 +50,7 @@ def apply_structured_changes(file_instructions, repo_dir):
                 f.write(file["content"])
             print(f"Written: {path}")
 
+
 @app.route('/requirement', methods=['POST'])
 def modernize_project():
     try:
@@ -55,28 +58,28 @@ def modernize_project():
         data = request.get_json()
         user_req = data.get('requestMessage')
         repo_path = data.get('githubRepo')  # This will now be just the repo path
-        
+
         if not user_req or not repo_path:
             return jsonify({
                 'error': 'Missing required fields: requirement and gitlab_repo_url (repo path)'
             }), 400
-        
+
         # Validate repo path format (should be username/repo-name)
         if '/' not in repo_path or repo_path.count('/') != 1:
             return jsonify({
                 'error': 'Invalid repo path format. Must be in format: username/repo-name'
             }), 400
-        
+
         # Load configuration
         current_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(current_dir, "integration.yml")
-        
+
         with open(config_path) as f:
             config = yaml.safe_load(f)
-        
+
         # Update config to use the provided repo path
         config["gitlab"]["repo_path"] = repo_path
-        
+
         # Use the same approach as main.py
         git_handler = AgenticGitHandler(
             gitlab_url=config["gitlab"]["url"],
@@ -91,22 +94,23 @@ def modernize_project():
         commit_msg = "Modernized code via structured AI agent"
 
         print("🔄 Starting code generation process...")
-        
+
         max_regeneration_attempts = 3
         for regeneration_attempt in range(max_regeneration_attempts):
             print(f"🔄 Regeneration attempt {regeneration_attempt + 1}/{max_regeneration_attempts}")
-            
+
             # Step 1: Generate code changes
             print("📝 Generating code changes...")
             file_instructions = generate_code(user_req)
             apply_structured_changes(file_instructions, config["repository"]["local_dir"])
 
             print("✅ Code generation completed!")
-            
+
             # Step 2: Run Agent 3's fix_and_build
             print("🔍 Running build verification and auto-fix with Agent 3...")
-            build_success, build_output = fix_and_build(config["repository"]["local_dir"], max_attempts=5, on_success=None)
-            
+            build_success, build_output = fix_and_build(config["repository"]["local_dir"], max_attempts=5,
+                                                        on_success=None)
+
             if build_success:
                 # Delete all .bak files before committing
                 for root, dirs, files in os.walk(config["repository"]["local_dir"]):
@@ -118,34 +122,35 @@ def modernize_project():
                                 print(f"Deleted backup file: {bak_path}")
                             except Exception as e:
                                 print(f"Failed to delete backup file {bak_path}: {e}")
-                
+
                 # Remove any .bak files from git index if they are staged
                 repo = git.Repo(config["repository"]["local_dir"])
                 for root, dirs, files in os.walk(config["repository"]["local_dir"]):
                     for file in files:
                         if file.endswith('.bak'):
-                            bak_path = os.path.relpath(os.path.join(root, file), config["repository"]["local_dir"]).replace(os.sep, '/')
+                            bak_path = os.path.relpath(os.path.join(root, file),
+                                                       config["repository"]["local_dir"]).replace(os.sep, '/')
                             try:
                                 tracked_files = repo.git.ls_files(bak_path)
                                 if tracked_files:
                                     repo.git.rm("--cached", bak_path)
                             except Exception:
                                 pass
-                
+
                 # Generate MR description
                 refined_req = refine_requirement(user_req)
                 mr_description = generate_mr_description(refined_req, user_req)
-                
+
                 # Create the merge request and get the URL
                 print("📤 Committing changes and creating merge request...")
                 git_handler.apply_and_commit_changes(repo, branch_name, commit_msg)
                 mr_url = git_handler.create_merge_request(
-                    branch_name, 
-                    config["gitlab"]["default_branch"], 
+                    branch_name,
+                    config["gitlab"]["default_branch"],
                     user_req,
                     mr_description
                 )
-                
+
                 return jsonify({
                     'success': True,
                     'mr_description': mr_description,
@@ -158,7 +163,7 @@ def modernize_project():
                 if regeneration_attempt < max_regeneration_attempts - 1:
                     print("🔄 Calling Agent 2 to regenerate code...")
                     continue
-        
+
         # If we get here, all regeneration attempts failed
         return jsonify({
             'success': False,
@@ -172,12 +177,13 @@ def modernize_project():
         error_details = traceback.format_exc()
         print(f"Error occurred: {str(e)}")
         print(f"Traceback: {error_details}")
-        
+
         return jsonify({
             'success': False,
             'error': f'An error occurred: {str(e)}',
             'details': error_details
         }), 500
+
 
 @app.route('/health', methods=['GET'])
 def health_check():
@@ -186,5 +192,6 @@ def health_check():
         'message': 'Agentic AI API is running'
     })
 
+
 if __name__ == '__main__':
-    app.run(debug=True, host='0.0.0.0', port=5000) 
+    app.run(debug=True, use_reloader=False, host='0.0.0.0', port=5000)
