@@ -153,8 +153,8 @@ def modernize_project():
 
                 return jsonify({
                     'success': True,
-                    'mr_description': mr_description,
-                    'mr_url': mr_url,
+                    'mr_details': mr_description,
+                    'mr_link': mr_url,
                     'branch_name': branch_name,
                     'regeneration_attempts': regeneration_attempt + 1
                 })
