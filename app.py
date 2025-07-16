@@ -185,6 +185,79 @@ def modernize_project():
         }), 500
 
 
+@app.route('/summarize', methods=['POST'])
+def summarize_project():
+    try:
+        data = request.get_json()
+        repo_path = data.get('githubRepo')
+        if not repo_path:
+            return jsonify({'error': 'Missing required field: githubRepo'}), 400
+        if '/' not in repo_path or repo_path.count('/') != 1:
+            return jsonify({'error': 'Invalid repo path format. Must be in format: username/repo-name'}), 400
+
+        # Load configuration
+        current_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(current_dir, "integration.yml")
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+        config["gitlab"]["repo_path"] = repo_path
+
+        # Clone or pull repo
+        git_handler = AgenticGitHandler(
+            gitlab_url=config["gitlab"]["url"],
+            repo_path=config["gitlab"]["repo_path"],
+            private_token=config["gitlab"]["private_token"],
+            default_branch=config["gitlab"]["default_branch"],
+            local_repo_dir=config["repository"]["local_dir"]
+        )
+        git_handler.clone_or_pull_repo()
+        repo_dir = config["repository"]["local_dir"]
+
+        # Read all code files (skip binary/large files)
+        def get_code_files(base_dir):
+            code_files = []
+            for root, _, files in os.walk(base_dir):
+                for file in files:
+                    if file.endswith((".py", ".java", ".js", ".ts", ".xml", ".yml", ".yaml", ".properties", ".md")):
+                        file_path = os.path.join(root, file)
+                        try:
+                            with open(file_path, "r", encoding="utf-8") as f:
+                                content = f.read()
+                                rel_path = os.path.relpath(file_path, base_dir)
+                                # Limit individual file size to 30KB
+                                if len(content) < 30_000:
+                                    code_files.append(f"// FILE: {rel_path}\n{content}")
+                        except Exception:
+                            continue
+            return code_files
+
+        code_files = get_code_files(repo_dir)
+        code_snapshot = "\n\n".join(code_files)
+        if not code_snapshot:
+            return jsonify({'error': 'No code files found in the repository.'}), 404
+
+        # Summarize with Gemini
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        llm = ChatGoogleGenerativeAI(model=config["gemini"]["model"], google_api_key=config["gemini"]["api_key"])
+        prompt = (
+            "You are an expert software analyst. Given the following codebase, provide a simple, point-wise summary of the project. "
+            "Use clear, non-technical language suitable for a non-developer. List the main features, technologies, and structure. "
+            "If possible, mention the main purpose of the project, key components, and any notable patterns.\n\n"
+            "Codebase Snapshot:\n" + code_snapshot + "\n\n"
+            "Summary (in bullet points):"
+        )
+        result = llm.invoke(prompt).content
+        if not isinstance(result, str):
+            result = str(result)
+        return jsonify({'summary': result})
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error occurred: {str(e)}")
+        print(f"Traceback: {error_details}")
+        return jsonify({'error': f'An error occurred: {str(e)}', 'details': error_details}), 500
+
+
 @app.route('/health', methods=['GET'])
 def health_check():
     return jsonify({
