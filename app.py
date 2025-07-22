@@ -102,7 +102,7 @@ def generate_and_apply_code(user_req, config):
 
 
 # Runs build and deploy, cleans up .bak files, and returns build results.
-def build_and_cleanup(config, max_attempts=5):
+def build_and_cleanup(config, max_attempts=3):
     build_success, build_output, endpoint_url, health_ok, health_url = build_and_deploy(config["repository"]["local_dir"], max_attempts=max_attempts)
     if build_success:
         # Delete all .bak files before committing
@@ -138,7 +138,7 @@ def regenerate_until_success(user_req, config, max_regeneration_attempts, git_ha
         print("✅ Code generation completed!")
         # Step 2: Run Agent 3's fix_and_build and cleanup
         print("🔍 Running build verification and auto-fix with Agent 3...")
-        build_success, build_output, endpoint_url, health_ok, health_url = build_and_cleanup(config, max_attempts=5)
+        build_success, build_output, endpoint_url, health_ok, health_url = build_and_cleanup(config, max_attempts=3)
         if build_success:
             return {
                 'success': True,
@@ -203,6 +203,7 @@ def modernize_project():
             return jsonify({
                 'success': True,
                 'mr_details': mr_description,
+                'mr_link': mr_url,
                 'branch_name': branch_name,
                 'regeneration_attempts': regen_result['regeneration_attempts'],
                 'endpoint_url': regen_result['endpoint_url'] if regen_result['endpoint_health'] else None,
