@@ -244,6 +244,7 @@ def apply_fixes(fixes: List[Dict], code_dir: str) -> bool:
 def fix_and_build(code_dir: str, max_attempts: int = 3, on_success: Optional[Callable]=None) -> tuple[bool, str]:
     """
     Try to build with 'mvn clean compile', then 'mvn package', auto-fix with LLM if either fails, and call on_success if both pass.
+    Returns (success, build_output)
     """
     if not check_maven_available():
         return False, "Maven is not available in the system PATH. Please install Maven and ensure it's in your PATH."
@@ -301,3 +302,87 @@ def fix_and_build(code_dir: str, max_attempts: int = 3, on_success: Optional[Cal
                 continue
     print("❌ Build or package failed after max attempts.")
     return False, output
+
+def deploy_and_check_health(artifact_path):
+    import shutil, subprocess, time, requests, os
+    endpoint_url = None
+    deployment_type = None
+    health_ok = False
+    log_file_path = os.path.join(os.path.dirname(artifact_path), "deployment.log")
+    health_url_found = None
+
+    if artifact_path:
+        if artifact_path.endswith('.war'):
+            # Deploy WAR to Tomcat
+            tomcat_webapps = '/usr/local/tomcat/webapps'
+            artifact_name = os.path.splitext(os.path.basename(artifact_path))[0]
+            deployed_path = os.path.join(tomcat_webapps, os.path.basename(artifact_path))
+            try:
+                shutil.copy2(artifact_path, deployed_path)
+                deployment_type = 'war'
+                endpoint_url = f'http://localhost:8080/{artifact_name}/'
+                # Optionally restart Tomcat here if needed
+            except Exception as e:
+                print(f'Failed to deploy WAR: {e}')
+        elif artifact_path.endswith('.jar'):
+            # Run JAR in background and log output
+            try:
+                with open(log_file_path, "w") as log_file:
+                    subprocess.Popen(['java', '-jar', artifact_path, '--server.port=8080'], stdout=log_file, stderr=subprocess.STDOUT)
+                deployment_type = 'jar'
+                endpoint_url = 'http://localhost:8080/'
+            except Exception as e:
+                print(f'Failed to run JAR: {e}')
+                with open(log_file_path, "a") as log_file:
+                    log_file.write(f"\nFailed to start JAR process: {e}")
+
+    # --- Health check logic ---
+    if endpoint_url:
+        # Check both /actuator/health and /health
+        health_endpoints = ['/actuator/health', '/health']
+        print(f"Waiting for application to start at {endpoint_url}...")
+        for _ in range(30):  # Wait up to 30 seconds
+            for endpoint in health_endpoints:
+                health_url = endpoint_url.rstrip('/') + endpoint
+                try:
+                    resp = requests.get(health_url, timeout=2)
+                    if resp.status_code == 200:
+                        health_ok = True
+                        health_url_found = health_url
+                        print(f"✅ Health check passed at: {health_url_found}")
+                        break
+                except requests.exceptions.RequestException:
+                    pass
+            if health_ok:
+                break
+            time.sleep(1)
+
+        if not health_ok:
+            print("❌ Health check failed. Application did not become healthy in 30 seconds.")
+            print(f"Deployment logs can be found in: {log_file_path}")
+            try:
+                with open(log_file_path, "r") as log_file:
+                    print("--- Deployment Log ---")
+                    print(log_file.read())
+                    print("----------------------")
+            except Exception as e:
+                print(f"Could not read deployment log file: {e}")
+
+    return endpoint_url, health_ok, health_url_found
+
+def build_and_deploy(code_dir, max_attempts=3, on_success=None):
+    build_success, build_output = fix_and_build(code_dir, max_attempts, on_success)
+    endpoint_url, health_ok, health_url = (None, False, None)
+    if build_success:
+        artifact_path = None
+        target_dir = os.path.join(code_dir, 'target')
+        if os.path.isdir(target_dir):
+            for file in os.listdir(target_dir):
+                if file.endswith('.jar') or file.endswith('.war'):
+                    artifact_path = os.path.join(target_dir, file)
+                    break
+        if artifact_path:
+            endpoint_url, health_ok, health_url = deploy_and_check_health(artifact_path)
+        else:
+            print("❌ No artifact found to deploy.")
+    return build_success, build_output, endpoint_url, health_ok, health_url

@@ -1,13 +1,16 @@
 from flask import Flask, request, jsonify
 from agents.agent1_req_refiner import refine_requirement
 from agents.agent2_code_gen import generate_code
-from agents.agent3_test_gen import fix_and_build
+from agents.agent3_test_gen import fix_and_build, build_and_deploy
 from git_handler import AgenticGitHandler
 from datetime import datetime
 import yaml
 import os
 import git
 from flask_cors import CORS
+import uuid
+from plantuml import PlantUML
+from plantuml import PlantUMLHTTPError
 
 app = Flask(__name__)
 CORS(app)
@@ -49,6 +52,30 @@ def apply_structured_changes(file_instructions, repo_dir):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(file["content"])
             print(f"Written: {path}")
+
+
+def render_plantuml_to_png(plantuml_code, output_dir="diagrams"):
+    os.makedirs(output_dir, exist_ok=True)
+    unique_id = str(uuid.uuid4())
+    png_path = os.path.join(output_dir, f"diagram_{unique_id}.png")
+    # Ensure PlantUML code has @startuml/@enduml
+    code = plantuml_code.strip()
+    if not code.startswith("@startuml"):
+        code = "@startuml\n" + code
+    if not code.endswith("@enduml"):
+        code = code + "\n@enduml"
+    # Write to a temp .puml file
+    puml_path = os.path.join(output_dir, f"diagram_{unique_id}.puml")
+    with open(puml_path, "w", encoding="utf-8") as f:
+        f.write(code)
+    # Render using PlantUML server (default public server)
+    server = PlantUML(url="http://www.plantuml.com/plantuml/img/")
+    try:
+        server.processes_file(puml_path, png_path)
+    except PlantUMLHTTPError as e:
+        print(f"PlantUMLHTTPError occurred: {e}")
+        return None
+    return png_path
 
 
 @app.route('/requirement', methods=['POST'])
@@ -108,8 +135,7 @@ def modernize_project():
 
             # Step 2: Run Agent 3's fix_and_build
             print("🔍 Running build verification and auto-fix with Agent 3...")
-            build_success, build_output = fix_and_build(config["repository"]["local_dir"], max_attempts=5,
-                                                        on_success=None)
+            build_success, build_output, endpoint_url, health_ok, health_url = build_and_deploy(config["repository"]["local_dir"], max_attempts=5)
 
             if build_success:
                 # Delete all .bak files before committing
@@ -137,6 +163,11 @@ def modernize_project():
                             except Exception:
                                 pass
 
+                # --- Deployment logic ---
+                # The build_and_deploy function was already called, so we don't need to call it again.
+                # The variables build_success, build_output, endpoint_url, health_ok are already populated.
+                # --- End deployment logic ---
+
                 # Generate MR description
                 refined_req = refine_requirement(user_req)
                 mr_description = generate_mr_description(refined_req, user_req)
@@ -151,12 +182,53 @@ def modernize_project():
                     mr_description
                 )
 
+                # Generate PlantUML diagram for the modernized codebase
+                def get_code_files(base_dir):
+                    code_files = []
+                    for root, _, files in os.walk(base_dir):
+                        for file in files:
+                            if file.endswith((".py", ".java", ".js", ".ts", ".xml", ".yml", ".yaml", ".properties", ".md")):
+                                file_path = os.path.join(root, file)
+                                try:
+                                    with open(file_path, "r", encoding="utf-8") as f:
+                                        content = f.read()
+                                        rel_path = os.path.relpath(file_path, base_dir)
+                                        if len(content) < 30_000:
+                                            code_files.append(f"// FILE: {rel_path}\n{content}")
+                                except Exception:
+                                    continue
+                    return code_files
+
+                code_files = get_code_files(config["repository"]["local_dir"])
+                code_snapshot = "\n\n".join(code_files)
+                from langchain_google_genai import ChatGoogleGenerativeAI
+                llm = ChatGoogleGenerativeAI(model=config["gemini"]["model"], google_api_key=config["gemini"]["api_key"])
+                plantuml_prompt = (
+                    "You are an expert software architect. Given the following codebase, generate a PlantUML diagram (using @startuml ... @enduml) that represents the high-level structure of the entire codebase. "
+                    "Show the main modules, classes, and their relationships (such as dependencies, inheritance, or usage). "
+                    "Focus on the most important components and their connections. Do not include code, only the diagram.\n\n"
+                    "Codebase Snapshot:\n" + code_snapshot + "\n\n"
+                    "PlantUML diagram:"
+                )
+                plantuml_result = llm.invoke(plantuml_prompt).content
+                if not isinstance(plantuml_result, str):
+                    plantuml_result = str(plantuml_result)
+                if plantuml_result.strip().startswith("```plantuml"):
+                    plantuml_result = plantuml_result.strip().lstrip("```plantuml").rstrip("```").strip()
+                elif plantuml_result.strip().startswith("```"):
+                    plantuml_result = plantuml_result.strip().lstrip("```").rstrip("```").strip()
+                png_path = render_plantuml_to_png(plantuml_result)
+
                 return jsonify({
                     'success': True,
                     'mr_details': mr_description,
                     'mr_link': mr_url,
                     'branch_name': branch_name,
-                    'regeneration_attempts': regeneration_attempt + 1
+                    'regeneration_attempts': regeneration_attempt + 1,
+                    'endpoint_url': endpoint_url if health_ok else None,
+                    'endpoint_health': health_ok,
+                    'actuator_health_url': health_url if health_ok else None,
+                    'plantuml_png': png_path
                 })
             else:
                 print(f"❌ Build failed after 5 attempts in regeneration {regeneration_attempt + 1}")
@@ -249,7 +321,28 @@ def summarize_project():
         result = llm.invoke(prompt).content
         if not isinstance(result, str):
             result = str(result)
-        return jsonify({'summary': result})
+
+        # Generate PlantUML diagram of codebase structure
+        plantuml_prompt = (
+            "You are an expert software architect. Given the following codebase, generate a PlantUML diagram (using @startuml ... @enduml) that represents the high-level structure of the entire codebase. "
+            "Show the main modules, classes, and their relationships (such as dependencies, inheritance, or usage). "
+            "Focus on the most important components and their connections. Do not include code, only the diagram.\n\n"
+            "Codebase Snapshot:\n" + code_snapshot + "\n\n"
+            "PlantUML diagram:"
+        )
+        plantuml_result = llm.invoke(plantuml_prompt).content
+        if not isinstance(plantuml_result, str):
+            plantuml_result = str(plantuml_result)
+        # Clean up markdown formatting if present
+        if plantuml_result.strip().startswith("```plantuml"):
+            plantuml_result = plantuml_result.strip().lstrip("```plantuml").rstrip("```").strip()
+        elif plantuml_result.strip().startswith("```"):
+            plantuml_result = plantuml_result.strip().lstrip("```").rstrip("```").strip()
+
+        # Render PlantUML to PNG and get file path
+        png_path = render_plantuml_to_png(plantuml_result)
+
+        return jsonify({'summary': result, 'plantuml_png': png_path})
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()

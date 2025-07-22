@@ -102,6 +102,7 @@ def generate_code(refined_req: str) -> list:
             "CRITICAL: Do NOT generate any new JUnit or test classes. The codebase should not contain any test files after your changes.\n"
             "IMPORTANT: Only add stable dependencies to pom.xml that are present in Maven Central. Do NOT add dependencies that do not exist in Maven Central or are not present in the codebase.\n"
             "CRITICAL: When generating JPA entities, ALWAYS annotate the class with @Entity, and annotate the primary key field with @Id and @GeneratedValue(strategy = GenerationType.IDENTITY). Import all necessary JPA annotations. Every entity must be a valid, managed JPA entity to avoid 'Not a managed type' errors.\n"
+            "IMPORTANT: If the project is a Spring Boot application, ALWAYS add the 'spring-boot-starter-actuator' dependency to pom.xml (if not already present), using a stable version from Maven Central.\n"
             f"Requirement:\n{refined_req}\n"
             f"Codebase Snapshot:\n{existing_code}"
         )
