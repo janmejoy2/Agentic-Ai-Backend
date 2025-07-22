@@ -3,6 +3,8 @@ import git
 import gitlab
 from datetime import datetime
 from gitlab.exceptions import GitlabError
+import subprocess
+import signal
 
 class AgenticGitHandler:
     def __init__(self, gitlab_url, repo_path, private_token, default_branch, local_repo_dir):
@@ -13,11 +15,62 @@ class AgenticGitHandler:
         self.local_repo_dir = local_repo_dir
         self.project = gitlab.Gitlab(gitlab_url, private_token=private_token).projects.get(repo_path)
 
+    def stop_spring_server_and_cleanup(self, local_repo_dir):
+        """
+        Stop any running Java (Spring) server related to the repo and delete locked files.
+        """
+        target_dir = os.path.join(local_repo_dir, 'target')
+        # Try to find and kill any Java process running from this repo's target directory
+        try:
+            # List all Java processes (requires JDK's jps tool)
+            result = subprocess.run(['jps', '-l'], capture_output=True, text=True)
+            for line in result.stdout.splitlines():
+                if 'jar' in line or 'war' in line:
+                    pid, name = line.split(maxsplit=1)
+                    # If the process is running from our target dir or matches our JAR/WAR, kill it
+                    if 'target' in name or local_repo_dir in name:
+                        print(f"Killing Java process {pid} ({name})")
+                        try:
+                            os.kill(int(pid), signal.SIGTERM)
+                        except Exception as e:
+                            print(f"Failed to kill process {pid}: {e}")
+        except Exception as e:
+            print(f"Could not check or kill Java processes: {e}")
+
+        # Now try to delete the files
+        for fname in ['deployment.log', 'employee-servlet-api-0.0.1-SNAPSHOT.jar']:
+            fpath = os.path.join(target_dir, fname)
+            if os.path.exists(fpath):
+                try:
+                    os.remove(fpath)
+                    print(f"Deleted {fpath}")
+                except Exception as e:
+                    print(f"Failed to delete {fpath}: {e}")
+
     def clone_or_pull_repo(self):
         print(f"Cloning/pulling repository: {self.repo_path} into {self.local_repo_dir}")
         if os.path.exists(self.local_repo_dir):
             repo = git.Repo(self.local_repo_dir)
             try:
+                # Stop any running Spring server and delete locked files before git operations
+                self.stop_spring_server_and_cleanup(self.local_repo_dir)
+                # Clean untracked files and reset tracked files before checkout
+                repo.git.reset('--hard')
+                repo.git.clean('-fd')
+                # Force remove problematic deployment.log from index and disk if it exists
+                log_path = os.path.join(self.local_repo_dir, 'target', 'deployment.log')
+                git_log_path = os.path.relpath(log_path, self.local_repo_dir).replace(os.sep, '/')
+                if os.path.exists(log_path):
+                    try:
+                        # Remove from git index if staged
+                        try:
+                            repo.git.rm('-f', '--cached', git_log_path)
+                        except Exception:
+                            pass  # Ignore if not staged
+                        os.remove(log_path)
+                        print(f"Deleted problematic file: {log_path}")
+                    except Exception as e:
+                        print(f"Failed to delete {log_path}: {e}")
                 repo.git.checkout(self.default_branch)
                 if repo.active_branch.tracking_branch() is None:
                     repo.git.branch(f"--set-upstream-to=origin/{self.default_branch}", self.default_branch)

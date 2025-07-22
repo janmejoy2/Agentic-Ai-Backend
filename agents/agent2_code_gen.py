@@ -3,6 +3,7 @@ import yaml
 from langchain_google_genai import ChatGoogleGenerativeAI
 import json
 import re
+import shutil
 
 # Get the directory where this script is located
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -140,3 +141,26 @@ def generate_code(refined_req: str) -> list:
             print(raw_output)
             raise e
     return []
+
+
+def generate_mr_description(plan: str, user_req: str) -> str:
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    config_path = os.path.join(project_root, "integration.yml")
+
+    with open(config_path) as f:
+        config = yaml.safe_load(f)
+
+    llm = ChatGoogleGenerativeAI(model=config["gemini"]["model"], google_api_key=config["gemini"]["api_key"])
+    prompt = (
+        "Given the following modernization plan and user requirement, generate a concise, clear merge request description. "
+        "Summarize the plan and briefly describe the main implementation changes. "
+        "Use simple, non-technical language that is easy to understand for non-developers. "
+        "Present the description in clear, bullet-point format for readability.\n\n"
+        f"User Requirement:\n{user_req}\n\n"
+        f"Modernization Plan:\n{plan}\n"
+        "\nDescription (in bullet points):"
+    )
+    result = llm.invoke(prompt).content
+    if not isinstance(result, str):
+        result = str(result)
+    return result
