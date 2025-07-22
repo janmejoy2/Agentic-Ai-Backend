@@ -4,3 +4,6 @@ python-gitlab
 pyyaml
 gitpython
 flask-cors
+plantuml
+requests
+six
