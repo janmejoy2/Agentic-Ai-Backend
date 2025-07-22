@@ -1,9 +1,9 @@
 gemini:
-  api_key: "AIzaSyCtNlnNTKQgRWvFgUFjvDVVjF3TPzHHKKI"
+  api_key: <Gemini Key>
   model: "gemini-1.5-flash-002"
 
 gitlab:
-  private_token: "glpat-dYJRiXC2VHQnK77spquE"
+  private_token: <TOKEN>
   url: "https://gitlab.com"
   repo_path: "janmejoyparida/employeeapi"
   default_branch: main
