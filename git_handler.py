@@ -52,50 +52,57 @@ class AgenticGitHandler:
         if os.path.exists(self.local_repo_dir):
             repo = git.Repo(self.local_repo_dir)
             try:
-                # Stop any running Spring server and delete locked files before git operations
+                print("[GIT] Stopping any running Spring server and cleaning up locked files...")
                 self.stop_spring_server_and_cleanup(self.local_repo_dir)
-                # Clean untracked files and reset tracked files before checkout
-                repo.git.reset('--hard')
-                repo.git.clean('-fd')
-                # Force remove problematic deployment.log from index and disk if it exists
-                log_path = os.path.join(self.local_repo_dir, 'target', 'deployment.log')
-                git_log_path = os.path.relpath(log_path, self.local_repo_dir).replace(os.sep, '/')
-                if os.path.exists(log_path):
-                    try:
-                        # Remove from git index if staged
-                        try:
-                            repo.git.rm('-f', '--cached', git_log_path)
-                        except Exception:
-                            pass  # Ignore if not staged
-                        os.remove(log_path)
-                        print(f"Deleted problematic file: {log_path}")
-                    except Exception as e:
-                        print(f"Failed to delete {log_path}: {e}")
+                # Only clean/reset if there are uncommitted changes or untracked files
+                if repo.is_dirty(untracked_files=True) or repo.untracked_files:
+                    print("[GIT] Repo has uncommitted changes or untracked files. Cleaning and resetting...")
+                    repo.git.reset('--hard')
+                    repo.git.clean('-fd')
+                else:
+                    print("[GIT] Repo is already clean. No reset/clean needed.")
+                print(f"[GIT] Checking out branch: {self.default_branch}")
                 repo.git.checkout(self.default_branch)
                 if repo.active_branch.tracking_branch() is None:
+                    print(f"[GIT] Setting upstream for branch: {self.default_branch}")
                     repo.git.branch(f"--set-upstream-to=origin/{self.default_branch}", self.default_branch)
+                print(f"[GIT] Pulling latest changes from origin/{self.default_branch}")
                 repo.remotes.origin.pull()
-                print(f"Repository updated on branch '{self.default_branch}'.")
+                print(f"[GIT] Repository updated on branch '{self.default_branch}'.")
             except Exception as e:
-                print(f"Error during pull: {e}")
+                print(f"[GIT] Error during pull: {e}")
                 raise e
         else:
+            print(f"[GIT] Local repo does not exist. Cloning from remote...")
             repo_url = f"https://oauth2:{self.private_token}@{self.gitlab_url.split('//')[1]}/{self.repo_path}.git"
             repo = git.Repo.clone_from(repo_url, self.local_repo_dir, branch=self.default_branch)
-            print(f"Repository cloned on branch '{self.default_branch}'.")
+            print(f"[GIT] Repository cloned on branch '{self.default_branch}'.")
         return repo
 
     def apply_and_commit_changes(self, repo, branch_name, commit_message):
         try:
+            print(f"[GIT] Checking out new branch: {branch_name}")
             repo.git.checkout('HEAD', b=branch_name)
         except git.GitCommandError as e:
             if "already exists" in str(e):
+                print(f"[GIT] Branch {branch_name} already exists. Checking it out.")
                 repo.git.checkout(branch_name)
             else:
                 raise e
 
-        # Exclude app.py, requirements.txt, target directory, and .bak files
-        repo.git.add(".")
+        # Only add and commit files that have actually changed
+        changed_files = [item.a_path for item in repo.index.diff(None)] + repo.untracked_files
+        # Only include files that exist on disk
+        existing_files = [f for f in changed_files if os.path.exists(os.path.join(self.local_repo_dir, f))]
+        missing_files = [f for f in changed_files if not os.path.exists(os.path.join(self.local_repo_dir, f))]
+        if missing_files:
+            print(f"[GIT] Skipping missing files (not found on disk): {missing_files}")
+        if not existing_files:
+            print("[GIT] No changes to commit.")
+            return
+        print(f"[GIT] Adding changed files to index: {existing_files}")
+        repo.index.add(existing_files)
+
         # Remove .bak files from git index if any are staged
         for root, dirs, files in os.walk(self.local_repo_dir):
             for file in files:
@@ -104,6 +111,7 @@ class AgenticGitHandler:
                     try:
                         tracked_files = repo.git.ls_files(bak_path)
                         if tracked_files:
+                            print(f"[GIT] Removing .bak file from index: {bak_path}")
                             repo.git.rm("--cached", bak_path)
                     except git.GitCommandError:
                         pass
@@ -113,6 +121,7 @@ class AgenticGitHandler:
         try:
             tracked_files = repo.git.ls_files(git_target_path)
             if tracked_files:
+                print(f"[GIT] Removing 'target' directory from index: {git_target_path}")
                 repo.git.rm("-r", "--cached", git_target_path)
         except git.GitCommandError:
             pass  # Ignore if not tracked
@@ -122,6 +131,7 @@ class AgenticGitHandler:
         try:
             tracked_files = repo.git.ls_files(git_app_py_path)
             if tracked_files:
+                print(f"[GIT] Removing 'app.py' from index: {git_app_py_path}")
                 repo.git.rm("--cached", git_app_py_path)
         except git.GitCommandError:
             pass
@@ -131,11 +141,14 @@ class AgenticGitHandler:
         try:
             tracked_files = repo.git.ls_files(git_reqs_path)
             if tracked_files:
+                print(f"[GIT] Removing 'requirements.txt' from index: {git_reqs_path}")
                 repo.git.rm("--cached", git_reqs_path)
         except git.GitCommandError:
             pass
 
+        print(f"[GIT] Committing changes with message: {commit_message}")
         repo.index.commit(commit_message)
+        print(f"[GIT] Pushing branch: {branch_name}")
         repo.remotes.origin.push(branch_name)
         print(f"✅ Code committed and pushed to branch: {branch_name}")
 

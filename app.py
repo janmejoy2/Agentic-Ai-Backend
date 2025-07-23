@@ -24,8 +24,12 @@ def apply_structured_changes(file_instructions, repo_dir):
 
         if file["action"] == "delete":
             if os.path.exists(path):
-                os.remove(path)
-                print(f"Deleted: {path}")
+                if os.path.isdir(path):
+                    shutil.rmtree(path)
+                    print(f"Deleted directory: {path}")
+                else:
+                    os.remove(path)
+                    print(f"Deleted file: {path}")
         elif file["action"] in ("update", "create"):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(file["content"])
@@ -150,7 +154,7 @@ def regenerate_until_success(user_req, config, max_regeneration_attempts, git_ha
                 'build_output': build_output
             }
         else:
-            print(f"❌ Build failed after 5 attempts in regeneration {regeneration_attempt + 1}")
+            print(f"❌ Build failed after 3 attempts in regeneration {regeneration_attempt + 1}")
             if regeneration_attempt < max_regeneration_attempts - 1:
                 print("🔄 Calling Agent 2 to regenerate code...")
     # If we get here, all regeneration attempts failed
