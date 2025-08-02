@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_from_directory
 from agents.agent1_req_refiner import refine_requirement
 from agents.agent2_code_gen import generate_code, generate_mr_description
 from agents.agent3_test_gen import fix_and_build, build_and_deploy
@@ -7,6 +7,7 @@ from datetime import datetime
 import yaml
 import os
 import git
+import shutil
 from flask_cors import CORS
 import uuid
 from plantuml import PlantUML
@@ -327,6 +328,13 @@ def summarize_project():
         print(f"Error occurred: {str(e)}")
         print(f"Traceback: {error_details}")
         return jsonify({'error': f'An error occurred: {str(e)}', 'details': error_details}), 500
+
+
+@app.route('/diagrams/<filename>')
+def serve_diagram(filename):
+    """Serve diagram files from the diagrams directory"""
+    diagrams_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'diagrams')
+    return send_from_directory(diagrams_dir, filename)
 
 
 @app.route('/health', methods=['GET'])
