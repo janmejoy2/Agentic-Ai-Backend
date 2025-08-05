@@ -65,15 +65,16 @@ def render_plantuml_to_png(plantuml_code, output_dir="diagrams"):
 def validate_modernize_request(data):
     user_req = data.get('requestMessage')
     repo_path = data.get('githubRepo')
+    flow_create = data.get('flowchart')
     if not user_req or not repo_path:
         return ({
-            'error': 'Missing required fields: requirement and gitlab_repo_url (repo path)'
-        }, None, None)
+                    'error': 'Missing required fields: requirement and gitlab_repo_url (repo path)'
+                }, None, None)
     if '/' not in repo_path or repo_path.count('/') != 1:
         return ({
-            'error': 'Invalid repo path format. Must be in format: username/repo-name'
-        }, None, None)
-    return (None, user_req, repo_path)
+                    'error': 'Invalid repo path format. Must be in format: username/repo-name'
+                }, None, None)
+    return (None, user_req, repo_path, flow_create)
 
 
 # Loads integration.yml config and updates the gitlab repo_path. Returns the config dict.
@@ -108,7 +109,8 @@ def generate_and_apply_code(user_req, config):
 
 # Runs build and deploy, cleans up .bak files, and returns build results.
 def build_and_cleanup(config, max_attempts=3):
-    build_success, build_output, endpoint_url, health_ok, health_url = build_and_deploy(config["repository"]["local_dir"], max_attempts=max_attempts)
+    build_success, build_output, endpoint_url, health_ok, health_url = build_and_deploy(
+        config["repository"]["local_dir"], max_attempts=max_attempts)
     if build_success:
         # Delete all .bak files before committing
         for root, dirs, files in os.walk(config["repository"]["local_dir"]):
@@ -125,7 +127,8 @@ def build_and_cleanup(config, max_attempts=3):
         for root, dirs, files in os.walk(config["repository"]["local_dir"]):
             for file in files:
                 if file.endswith('.bak'):
-                    bak_path = os.path.relpath(os.path.join(root, file), config["repository"]["local_dir"]).replace(os.sep, '/')
+                    bak_path = os.path.relpath(os.path.join(root, file), config["repository"]["local_dir"]).replace(
+                        os.sep, '/')
                     try:
                         repo.index.remove([bak_path], working_tree=True)
                     except Exception:
@@ -173,7 +176,7 @@ def modernize_project():
     try:
         # Get request data
         data = request.get_json()
-        error_response, user_req, repo_path = validate_modernize_request(data)
+        error_response, user_req, repo_path, flow_create = validate_modernize_request(data)
         if error_response:
             return jsonify(error_response), 400
 
@@ -186,7 +189,8 @@ def modernize_project():
         print("🔄 Starting code generation process...")
 
         max_regeneration_attempts = 3
-        regen_result = regenerate_until_success(user_req, config, max_regeneration_attempts, git_handler, branch_name, commit_msg)
+        regen_result = regenerate_until_success(user_req, config, max_regeneration_attempts, git_handler, branch_name,
+                                                commit_msg)
         if regen_result['success']:
             # Generate MR description
             refined_req = refine_requirement(user_req)
@@ -203,8 +207,11 @@ def modernize_project():
             # Generate PlantUML diagram for the modernized codebase
             code_files = get_code_files_for_summary(config["repository"]["local_dir"])
             code_snapshot = "\n\n".join(code_files)
-            plantuml_result = generate_plantuml_diagram(code_snapshot, config)
-            png_path = render_plantuml_to_png(plantuml_result)
+            if flow_create:
+               plantuml_result = generate_plantuml_diagram(code_snapshot, config)
+               png_path = render_plantuml_to_png(plantuml_result)
+            else:
+                png_path = None
             return jsonify({
                 'success': True,
                 'mr_details': mr_description,
@@ -261,11 +268,11 @@ def generate_gemini_summary(code_snapshot, config):
     from langchain_google_genai import ChatGoogleGenerativeAI
     llm = ChatGoogleGenerativeAI(model=config["gemini"]["model"], google_api_key=config["gemini"]["api_key"])
     prompt = (
-        "You are an expert software analyst. Given the following codebase, provide a simple, point-wise summary of the project. "
-        "Use clear, non-technical language suitable for a non-developer. List the main features, technologies, and structure. "
-        "If possible, mention the main purpose of the project, key components, and any notable patterns.\n\n"
-        "Codebase Snapshot:\n" + code_snapshot + "\n\n"
-        "Summary (in bullet points):"
+            "You are an expert software analyst. Given the following codebase, provide a simple, point-wise summary of the project. "
+            "Use clear, non-technical language suitable for a non-developer. List the main features, technologies, and structure. "
+            "If possible, mention the main purpose of the project, key components, and any notable patterns.\n\n"
+            "Codebase Snapshot:\n" + code_snapshot + "\n\n"
+                                                     "Summary (in bullet points):"
     )
     result = llm.invoke(prompt).content
     if not isinstance(result, str):
@@ -278,13 +285,13 @@ def generate_plantuml_diagram(code_snapshot, config):
     from langchain_google_genai import ChatGoogleGenerativeAI
     llm = ChatGoogleGenerativeAI(model=config["gemini"]["model"], google_api_key=config["gemini"]["api_key"])
     plantuml_prompt = (
-        "You are an expert software architect. Given the following codebase, generate a PlantUML diagram (using @startuml ... @enduml) that represents the high-level structure of the entire codebase. "
-        "Show the main modules, classes, and their relationships (such as dependencies, inheritance, or usage). "
-        "Focus on the most important components and their connections. Do not include code, only the diagram.\n\n"
-        "IMPORTANT: Only include the main application flow. Ignore and exclude any test classes, test files, or test-related code from the diagram.\n"
-        "Make the diagram clean and easy to read, with a simple, linear flow (top-down or left-to-right). Minimize crossing lines and clutter. Use PlantUML layout directives if needed.\n\n"
-        "Codebase Snapshot:\n" + code_snapshot + "\n\n"
-        "PlantUML diagram:"
+            "You are an expert software architect. Given the following codebase, generate a PlantUML diagram (using @startuml ... @enduml) that represents the high-level structure of the entire codebase. "
+            "Show the main modules, classes, and their relationships (such as dependencies, inheritance, or usage). "
+            "Focus on the most important components and their connections. Do not include code, only the diagram.\n\n"
+            "IMPORTANT: Only include the main application flow. Ignore and exclude any test classes, test files, or test-related code from the diagram.\n"
+            "Make the diagram clean and easy to read, with a simple, linear flow (top-down or left-to-right). Minimize crossing lines and clutter. Use PlantUML layout directives if needed.\n\n"
+            "Codebase Snapshot:\n" + code_snapshot + "\n\n"
+                                                     "PlantUML diagram:"
     )
     plantuml_result = llm.invoke(plantuml_prompt).content
     if not isinstance(plantuml_result, str):
@@ -302,6 +309,7 @@ def summarize_project():
     try:
         data = request.get_json()
         repo_path = data.get('githubRepo')
+        generate_flow = data.get('flowchart')
         if not repo_path:
             return jsonify({'error': 'Missing required field: githubRepo'}), 400
         if '/' not in repo_path or repo_path.count('/') != 1:
@@ -317,11 +325,15 @@ def summarize_project():
             return jsonify({'error': 'No code files found in the repository.'}), 404
 
         result = generate_gemini_summary(code_snapshot, config)
-        plantuml_result = generate_plantuml_diagram(code_snapshot, config)
-        png_path = render_plantuml_to_png(plantuml_result)
-        if png_path is None:
-            return jsonify({'summary': result, 'plantuml_png': None, 'error': 'Failed to generate PlantUML diagram image.'}), 200
-        return jsonify({'summary': result, 'plantuml_png': png_path})
+        if generate_flow:
+            plantuml_result = generate_plantuml_diagram(code_snapshot, config)
+            png_path = render_plantuml_to_png(plantuml_result)
+            if png_path is None:
+                return jsonify({'summary': result, 'plantuml_png': None,
+                                'error': 'Failed to generate PlantUML diagram image.'}), 200
+            return jsonify({'summary': result, 'plantuml_png': png_path})
+        else:
+            return jsonify({'summary': result, 'plantuml_png': None})
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
