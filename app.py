@@ -1,7 +1,11 @@
 from flask import Flask, request, jsonify, send_from_directory
 from agents.agent1_req_refiner import refine_requirement
 from agents.agent2_code_gen import generate_code, generate_mr_description
-from agents.agent3_test_gen import fix_and_build, build_and_deploy
+from agents.agent3_test_gen import create_test_agent_workflow
+from agents.agent4_build_deploy import create_build_deploy_agent_workflow
+from agents.workflows import create_modernize_graph
+from utils.file_ops import apply_structured_changes
+from utils.cleanup import setup_cleanup_handlers, cleanup_directories
 from git_handler import AgenticGitHandler
 from datetime import datetime
 import yaml
@@ -16,25 +20,8 @@ from plantuml import PlantUMLHTTPError
 app = Flask(__name__)
 CORS(app)
 
-
-# Applies file changes (create, update, delete) as instructed by the LLM/code generator to the local repo directory.
-def apply_structured_changes(file_instructions, repo_dir):
-    for file in file_instructions:
-        path = os.path.join(repo_dir, file["path"])
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-
-        if file["action"] == "delete":
-            if os.path.exists(path):
-                if os.path.isdir(path):
-                    shutil.rmtree(path)
-                    print(f"Deleted directory: {path}")
-                else:
-                    os.remove(path)
-                    print(f"Deleted file: {path}")
-        elif file["action"] in ("update", "create"):
-            with open(path, "w", encoding="utf-8") as f:
-                f.write(file["content"])
-            print(f"Written: {path}")
+# Set up cleanup handlers for graceful shutdown
+setup_cleanup_handlers()
 
 
 def render_plantuml_to_png(plantuml_code, output_dir="diagrams"):
@@ -103,96 +90,37 @@ def clone_or_pull_repo(config):
 def generate_and_apply_code(user_req, config):
     file_instructions = generate_code(user_req)
     apply_structured_changes(file_instructions, config["repository"]["local_dir"])
+    
+    # Perform additional cleanup to remove any legacy files that might have been missed
+    from utils.file_ops import ensure_clean_modernization
+    ensure_clean_modernization(config["repository"]["local_dir"])
+    
     return file_instructions
 
 
-# Runs build and deploy, cleans up .bak files, and returns build results.
-def build_and_cleanup(config, max_attempts=3):
-    build_success, build_output, endpoint_url, health_ok, health_url = build_and_deploy(config["repository"]["local_dir"], max_attempts=max_attempts)
-    if build_success:
-        # Delete all .bak files before committing
-        for root, dirs, files in os.walk(config["repository"]["local_dir"]):
-            for file in files:
-                if file.endswith('.bak'):
-                    bak_path = os.path.join(root, file)
-                    try:
-                        os.remove(bak_path)
-                        print(f"Deleted backup file: {bak_path}")
-                    except Exception as e:
-                        print(f"Failed to delete backup file {bak_path}: {e}")
-        # Remove any .bak files from git index if they are staged
-        repo = git.Repo(config["repository"]["local_dir"])
-        for root, dirs, files in os.walk(config["repository"]["local_dir"]):
-            for file in files:
-                if file.endswith('.bak'):
-                    bak_path = os.path.relpath(os.path.join(root, file), config["repository"]["local_dir"]).replace(os.sep, '/')
-                    try:
-                        repo.index.remove([bak_path], working_tree=True)
-                    except Exception:
-                        pass
-    return build_success, build_output, endpoint_url, health_ok, health_url
-
-
-# Handles the regeneration loop: generates code, builds, and returns result or error after max attempts.
-def regenerate_until_success(user_req, config, max_regeneration_attempts, git_handler, branch_name, commit_msg):
-    for regeneration_attempt in range(max_regeneration_attempts):
-        print(f"🔄 Regeneration attempt {regeneration_attempt + 1}/{max_regeneration_attempts}")
-        # Step 1: Generate code changes
-        print("📝 Generating code changes...")
-        file_instructions = generate_and_apply_code(user_req, config)
-        print("✅ Code generation completed!")
-        # Step 2: Run Agent 3's fix_and_build and cleanup
-        print("🔍 Running build verification and auto-fix with Agent 3...")
-        build_success, build_output, endpoint_url, health_ok, health_url = build_and_cleanup(config, max_attempts=3)
-        if build_success:
-            return {
-                'success': True,
-                'file_instructions': file_instructions,
-                'regeneration_attempts': regeneration_attempt + 1,
-                'endpoint_url': endpoint_url,
-                'endpoint_health': health_ok,
-                'actuator_health_url': health_url,
-                'build_output': build_output
-            }
-        else:
-            print(f"❌ Build failed after 3 attempts in regeneration {regeneration_attempt + 1}")
-            if regeneration_attempt < max_regeneration_attempts - 1:
-                print("🔄 Calling Agent 2 to regenerate code...")
-    # If we get here, all regeneration attempts failed
-    return {
-        'success': False,
-        'error': 'Build verification failed after all regeneration attempts',
-        'build_output': build_output,
-        'regeneration_attempts': max_regeneration_attempts
-    }
-
-
-# Flask route: Modernizes a project by cloning a repo, generating code changes with LLM, building, and returning results.
+# Flask route: Modernizes a project using LangGraph workflow
 @app.route('/requirement', methods=['POST'])
 def modernize_project():
     try:
-        # Get request data
         data = request.get_json()
         error_response, user_req, repo_path = validate_modernize_request(data)
         if error_response:
             return jsonify(error_response), 400
 
         config = load_and_update_config(repo_path)
-
         git_handler, repo = clone_or_pull_repo(config)
+
         branch_name = f"feature_refactor_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        commit_msg = "Modernized code via structured AI agent"
+        commit_msg = "Modernized code via structured AI agent (LangGraph)"
 
-        print("🔄 Starting code generation process...")
+        graph = create_modernize_graph()
+        state = graph.invoke({"raw_requirement": user_req})
 
-        max_regeneration_attempts = 3
-        regen_result = regenerate_until_success(user_req, config, max_regeneration_attempts, git_handler, branch_name, commit_msg)
-        if regen_result['success']:
-            # Generate MR description
+        # Check if build was successful
+        if state.get('build_success'):
+            # Only create MR and commit changes if build was successful
             refined_req = refine_requirement(user_req)
             mr_description = generate_mr_description(refined_req, user_req)
-            # Create the merge request and get the URL
-            print("📤 Committing changes and creating merge request...")
             git_handler.apply_and_commit_changes(repo, branch_name, commit_msg)
             mr_url = git_handler.create_merge_request(
                 branch_name,
@@ -200,28 +128,30 @@ def modernize_project():
                 user_req,
                 mr_description
             )
+
             # Generate PlantUML diagram for the modernized codebase
             code_files = get_code_files_for_summary(config["repository"]["local_dir"])
             code_snapshot = "\n\n".join(code_files)
             plantuml_result = generate_plantuml_diagram(code_snapshot, config)
             png_path = render_plantuml_to_png(plantuml_result)
+
             return jsonify({
                 'success': True,
                 'mr_details': mr_description,
                 'mr_link': mr_url,
                 'branch_name': branch_name,
-                'regeneration_attempts': regen_result['regeneration_attempts'],
-                'endpoint_url': regen_result['endpoint_url'] if regen_result['endpoint_health'] else None,
-                'endpoint_health': regen_result['endpoint_health'],
-                'actuator_health_url': regen_result['actuator_health_url'] if regen_result['endpoint_health'] else None,
+                'endpoint_url': state.get('endpoint_url') if state.get('endpoint_health') else None,
+                'endpoint_health': state.get('endpoint_health'),
+                'actuator_health_url': state.get('actuator_health_url') if state.get('endpoint_health') else None,
                 'plantuml_png': png_path
             })
         else:
+            # Build failed - return error without creating MR
             return jsonify({
                 'success': False,
-                'error': regen_result['error'],
-                'build_output': regen_result['build_output'],
-                'regeneration_attempts': regen_result['regeneration_attempts']
+                'error': 'Build verification failed - merge request not created',
+                'build_output': state.get('build_output', 'No build output available'),
+                'branch_name': branch_name
             }), 500
 
     except Exception as e:
@@ -229,7 +159,57 @@ def modernize_project():
         error_details = traceback.format_exc()
         print(f"Error occurred: {str(e)}")
         print(f"Traceback: {error_details}")
+        return jsonify({'success': False, 'error': f'An error occurred: {str(e)}', 'details': error_details}), 500
 
+
+@app.route('/generate_tests', methods=['POST'])
+def generate_tests_for_project():
+    try:
+        data = request.get_json()
+        if not data or 'githubRepo' not in data:
+            return jsonify({'error': 'Missing githubRepo field'}), 400
+
+        repo_path = data['githubRepo']
+        if '/' not in repo_path or repo_path.count('/') != 1:
+            return jsonify({'error': 'Invalid repo path format. Must be in format: username/repo-name'}), 400
+
+        config = load_and_update_config(repo_path)
+        git_handler, repo = clone_or_pull_repo(config)
+
+        print("🧪 Starting test generation process...")
+
+        # Create and run the test generation workflow
+        test_workflow = create_test_agent_workflow()
+        test_state = test_workflow.invoke({"project_path": config["repository"]["local_dir"]})
+
+        if test_state.get('success'):
+            # Generate PlantUML diagram for the codebase with tests
+            code_files = get_code_files_for_summary(config["repository"]["local_dir"])
+            code_snapshot = "\n\n".join(code_files)
+            plantuml_result = generate_plantuml_diagram(code_snapshot, config)
+            png_path = render_plantuml_to_png(plantuml_result)
+
+            return jsonify({
+                'success': True,
+                'message': 'Test generation and coverage analysis complete',
+                'test_files_count': len(test_state.get('test_files', [])),
+                'coverage_data': test_state.get('coverage_data', {}),
+                'coverage_report': test_state.get('coverage_report', 'No coverage data'),
+                'report_url': test_state.get('report_url', ''),
+                'plantuml_png': png_path
+            })
+        else:
+            return jsonify({
+                'success': False,
+                'error': test_state.get('error', 'Test generation failed'),
+                'details': test_state.get('details', '')
+            }), 500
+
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error occurred: {str(e)}")
+        print(f"Traceback: {error_details}")
         return jsonify({
             'success': False,
             'error': f'An error occurred: {str(e)}',
@@ -237,108 +217,204 @@ def modernize_project():
         }), 500
 
 
-# Collects all relevant code files from the given base directory for summarization, skipping large/binary files.
 def get_code_files_for_summary(base_dir):
+    """Gets all code files from the base directory for summary generation."""
     code_files = []
-    for root, _, files in os.walk(base_dir):
+    for root, dirs, files in os.walk(base_dir):
+        # Skip .git directory
+        if '.git' in dirs:
+            dirs.remove('.git')
+        # Skip target directory (Maven build output)
+        if 'target' in dirs:
+            dirs.remove('target')
+        # Skip node_modules if present
+        if 'node_modules' in dirs:
+            dirs.remove('node_modules')
+        
         for file in files:
-            if file.endswith((".py", ".java", ".js", ".ts", ".xml", ".yml", ".yaml", ".properties", ".md")):
+            if file.endswith(('.java', '.py', '.js', '.ts', '.html', '.css', '.xml', '.yml', '.yaml', '.properties', '.md')):
                 file_path = os.path.join(root, file)
                 try:
-                    with open(file_path, "r", encoding="utf-8") as f:
+                    with open(file_path, 'r', encoding='utf-8') as f:
                         content = f.read()
-                        rel_path = os.path.relpath(file_path, base_dir)
-                        # Limit individual file size to 30KB
-                        if len(content) < 30_000:
-                            code_files.append(f"// FILE: {rel_path}\n{content}")
-                except Exception:
-                    continue
+                    relative_path = os.path.relpath(file_path, base_dir)
+                    code_files.append(f"File: {relative_path}\n{content}")
+                except Exception as e:
+                    print(f"Error reading file {file_path}: {e}")
     return code_files
 
 
-# Uses Gemini LLM to generate a non-technical, bullet-point summary of the codebase from the code snapshot.
 def generate_gemini_summary(code_snapshot, config):
+    """Generates a summary of the codebase using Gemini AI."""
     from langchain_google_genai import ChatGoogleGenerativeAI
-    llm = ChatGoogleGenerativeAI(model=config["gemini"]["model"], google_api_key=config["gemini"]["api_key"])
-    prompt = (
-        "You are an expert software analyst. Given the following codebase, provide a simple, point-wise summary of the project. "
-        "Use clear, non-technical language suitable for a non-developer. List the main features, technologies, and structure. "
-        "If possible, mention the main purpose of the project, key components, and any notable patterns.\n\n"
-        "Codebase Snapshot:\n" + code_snapshot + "\n\n"
-        "Summary (in bullet points):"
+    llm = ChatGoogleGenerativeAI(
+        model=config["gemini"]["model"],
+        google_api_key=config["gemini"]["api_key"],
+        temperature=0.1
     )
-    result = llm.invoke(prompt).content
-    if not isinstance(result, str):
-        result = str(result)
-    return result
+    
+    prompt = f"""
+    Analyze the following codebase and provide a comprehensive summary in bullet points.
+    Focus on:
+    - Main components and their purposes
+    - Technology stack used
+    - Key functionality
+    - Architecture patterns
+    - Dependencies and frameworks
+    
+    Codebase:
+    {code_snapshot}
+    
+    Provide a clear, structured summary with bullet points.
+    """
+    
+    response = llm.invoke(prompt)
+    return response.content
 
 
-# Uses Gemini LLM to generate a PlantUML diagram (as text) representing the high-level structure of the codebase.
 def generate_plantuml_diagram(code_snapshot, config):
+    """Generates a PlantUML diagram of the codebase architecture."""
     from langchain_google_genai import ChatGoogleGenerativeAI
-    llm = ChatGoogleGenerativeAI(model=config["gemini"]["model"], google_api_key=config["gemini"]["api_key"])
-    plantuml_prompt = (
-        "You are an expert software architect. Given the following codebase, generate a PlantUML diagram (using @startuml ... @enduml) that represents the high-level structure of the entire codebase. "
-        "Show the main modules, classes, and their relationships (such as dependencies, inheritance, or usage). "
-        "Focus on the most important components and their connections. Do not include code, only the diagram.\n\n"
-        "IMPORTANT: Only include the main application flow. Ignore and exclude any test classes, test files, or test-related code from the diagram.\n"
-        "Make the diagram clean and easy to read, with a simple, linear flow (top-down or left-to-right). Minimize crossing lines and clutter. Use PlantUML layout directives if needed.\n\n"
-        "Codebase Snapshot:\n" + code_snapshot + "\n\n"
-        "PlantUML diagram:"
+    llm = ChatGoogleGenerativeAI(
+        model=config["gemini"]["model"],
+        google_api_key=config["gemini"]["api_key"],
+        temperature=0.1
     )
-    plantuml_result = llm.invoke(plantuml_prompt).content
-    if not isinstance(plantuml_result, str):
-        plantuml_result = str(plantuml_result)
-    # Clean up markdown formatting if present
-    if plantuml_result.strip().startswith("```plantuml"):
-        plantuml_result = plantuml_result.strip().lstrip("```plantuml").rstrip("```").strip()
-    elif plantuml_result.strip().startswith("```"):
-        plantuml_result = plantuml_result.strip().lstrip("```").rstrip("```").strip()
-    return plantuml_result
+    
+    prompt = f"""
+    Analyze the following codebase and generate a PlantUML class diagram showing the main components, classes, and their relationships.
+    Focus on:
+    - Main classes and their methods
+    - Relationships between classes (inheritance, composition, association)
+    - Key interfaces and abstract classes
+    - Package structure if applicable
+    
+    Codebase:
+    {code_snapshot}
+    
+    Generate only the PlantUML diagram code (without @startuml/@enduml tags).
+    """
+    
+    response = llm.invoke(prompt)
+    return response.content
 
 
 @app.route('/summarize', methods=['POST'])
 def summarize_project():
     try:
         data = request.get_json()
-        repo_path = data.get('githubRepo')
-        if not repo_path:
-            return jsonify({'error': 'Missing required field: githubRepo'}), 400
+        if not data or 'githubRepo' not in data:
+            return jsonify({'error': 'Missing githubRepo field'}), 400
+
+        repo_path = data['githubRepo']
         if '/' not in repo_path or repo_path.count('/') != 1:
             return jsonify({'error': 'Invalid repo path format. Must be in format: username/repo-name'}), 400
 
         config = load_and_update_config(repo_path)
-        git_handler, _ = clone_or_pull_repo(config)
-        repo_dir = config["repository"]["local_dir"]
+        git_handler, repo = clone_or_pull_repo(config)
 
-        code_files = get_code_files_for_summary(repo_dir)
+        print("📊 Generating codebase summary and diagram...")
+
+        # Get all code files
+        code_files = get_code_files_for_summary(config["repository"]["local_dir"])
+        if not code_files:
+            return jsonify({'error': 'No code files found in the repository'}), 404
+
         code_snapshot = "\n\n".join(code_files)
-        if not code_snapshot:
-            return jsonify({'error': 'No code files found in the repository.'}), 404
 
-        result = generate_gemini_summary(code_snapshot, config)
+        # Generate summary
+        summary = generate_gemini_summary(code_snapshot, config)
+
+        # Generate PlantUML diagram
         plantuml_result = generate_plantuml_diagram(code_snapshot, config)
         png_path = render_plantuml_to_png(plantuml_result)
-        if png_path is None:
-            return jsonify({'summary': result, 'plantuml_png': None, 'error': 'Failed to generate PlantUML diagram image.'}), 200
-        return jsonify({'summary': result, 'plantuml_png': png_path})
+
+        return jsonify({
+            'summary': summary,
+            'plantuml_png': png_path
+        })
+
     except Exception as e:
         import traceback
         error_details = traceback.format_exc()
         print(f"Error occurred: {str(e)}")
         print(f"Traceback: {error_details}")
-        return jsonify({'error': f'An error occurred: {str(e)}', 'details': error_details}), 500
+        return jsonify({
+            'error': f'An error occurred: {str(e)}',
+            'details': error_details
+        }), 500
 
 
 @app.route('/diagrams/<filename>')
 def serve_diagram(filename):
-    """Serve diagram files from the diagrams directory"""
-    diagrams_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'diagrams')
-    return send_from_directory(diagrams_dir, filename)
+    """Serves generated PlantUML diagram images."""
+    return send_from_directory('diagrams', filename)
+
+
+@app.route('/cleanup', methods=['POST'])
+def manual_cleanup():
+    """Manually clean up temporary directories and files without shutting down the server."""
+    try:
+        data = request.get_json() or {}
+        force_cleanup = data.get('force', False)
+        
+        print("🧹 Starting manual cleanup...")
+        
+        # Get cleanup status first
+        from utils.cleanup import get_cleanup_status
+        status = get_cleanup_status()
+        
+        # Perform cleanup
+        cleaned_folders = cleanup_directories(force_cleanup=force_cleanup)
+        
+        return jsonify({
+            'success': True,
+            'message': 'Cleanup completed successfully',
+            'cleaned_folders': cleaned_folders,
+            'force_cleanup': force_cleanup
+        })
+        
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error during manual cleanup: {str(e)}")
+        print(f"Traceback: {error_details}")
+        
+        return jsonify({
+            'success': False,
+            'error': f'Cleanup failed: {str(e)}',
+            'details': error_details
+        }), 500
+
+
+@app.route('/cleanup/status', methods=['GET'])
+def get_cleanup_status():
+    """Get the current status of directories that would be cleaned up."""
+    try:
+        from utils.cleanup import get_cleanup_status as get_status
+        status = get_status()
+        
+        return jsonify({
+            'success': True,
+            'status': status
+        })
+        
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"Error getting cleanup status: {str(e)}")
+        print(f"Traceback: {error_details}")
+        
+        return jsonify({
+            'success': False,
+            'error': f'Failed to get cleanup status: {str(e)}',
+            'details': error_details
+        }), 500
 
 
 @app.route('/health', methods=['GET'])
 def health_check():
+    """Health check endpoint."""
     return jsonify({
         'status': 'healthy',
         'message': 'Agentic AI API is running'
@@ -346,4 +422,4 @@ def health_check():
 
 
 if __name__ == '__main__':
-    app.run(debug=True, use_reloader=False, host='0.0.0.0', port=5000)
+    app.run(debug=True, host='0.0.0.0', port=5000)

@@ -1,12 +1,28 @@
+# Agentic AI Backend Configuration
+
+# Gemini API Configuration
 gemini:
-  api_key: <Gemini Key>
-  model: "gemini-1.5-flash-002"
+  api_key: "AIzaSyCwLbtLUJ1hUMwzGpIzeF0TvKwMlB9Ar3Q"
+  model: "gemini-1.5-flash"
 
+# GitLab Configuration
 gitlab:
-  private_token: <TOKEN>
   url: "https://gitlab.com"
-  repo_path: "janmejoyparida/employeeapi"
-  default_branch: main
+  repo_path: "janmejoyparida/employeeapi"  # This will be updated dynamically
+  private_token: "glpat-dYJRiXC2VHQnK77spquE"
+  default_branch: "main"
 
+# Local Repository Configuration
 repository:
-  local_dir: ./generated_service
+  local_dir: "generated_service"
+
+# Agent Configuration
+agents:
+  skip_test_generation: true  # Set to true to skip Agent 3 (test generation)
+  skip_build_deploy: false     # Set to true to skip Agent 4 (build & deploy)
+
+# Cleanup Configuration
+cleanup:
+  auto_cleanup: true                    # Enable/disable automatic cleanup on shutdown
+  cleanup_on_startup: false             # Clean up on server startup (optional)
+  cleanup_diagrams: true                # Always clean up diagrams folder

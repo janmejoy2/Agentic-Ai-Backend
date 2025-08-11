@@ -1,388 +1,352 @@
-import subprocess
+import os
 import yaml
 import json
-import re
-import os
-import shutil
 from langchain_google_genai import ChatGoogleGenerativeAI
-from typing import Tuple, List, Dict, Optional, Callable
+from typing import List, Dict, Any, Tuple
 
-# Load configuration
-# Get the directory where this script is located
-current_dir = os.path.dirname(os.path.abspath(__file__))
-# Go up one level to the parent directory and find integration.yml
-config_path = os.path.join(os.path.dirname(current_dir), "integration.yml")
 
-with open(config_path) as f:
-    config = yaml.safe_load(f)
-GEMINI_API_KEY = config["gemini"]["api_key"]
-GEMINI_MODEL = config["gemini"]["model"]
-LOCAL_REPO_DIR = config["repository"]["local_dir"]
+def load_config() -> Dict[str, Any]:
+    """Load configuration from integration.yml"""
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    config_path = os.path.join(os.path.dirname(current_dir), "integration.yml")
+    with open(config_path) as f:
+        return yaml.safe_load(f)
 
-def check_maven_available() -> bool:
-    """
-    Check if Maven is available in the system PATH
-    """
-    try:
-        import platform
-        mvn_command = "mvn.cmd" if platform.system() == "Windows" else "mvn"
-        result = subprocess.run([mvn_command, "--version"], capture_output=True, text=True)
-        return result.returncode == 0
-    except Exception:
-        return False
 
-def run_maven_compile(code_dir: str) -> Tuple[bool, str, str]:
+def get_source_files_for_testing(repo_dir: str) -> str:
     """
-    Run 'mvn clean compile' and return (success, stdout, stderr)
+    Get all source code files that need test coverage.
+    Focuses on Java source files and configuration.
     """
-    import platform
-    mvn_command = "mvn.cmd" if platform.system() == "Windows" else "mvn"
-    try:
-        print(f"🔨 Running Maven clean compile in directory: {code_dir}")
-        result = subprocess.run(
-            [mvn_command, "clean", "compile"],
-            cwd=code_dir,
-            capture_output=True,
-            text=True,
-            timeout=300
-        )
-        return result.returncode == 0, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        return False, "", "Maven compile timed out after 5 minutes"
-    except Exception as e:
-        return False, "", f"Maven compile failed with exception: {str(e)}"
-
-def run_maven_package(code_dir: str) -> tuple[bool, str, str]:
-    """
-    Run 'mvn package' and return (success, stdout, stderr)
-    """
-    import platform
-    mvn_command = "mvn.cmd" if platform.system() == "Windows" else "mvn"
-    try:
-        print(f"📦 Running Maven package in directory: {code_dir}")
-        result = subprocess.run(
-            [mvn_command, "package"],
-            cwd=code_dir,
-            capture_output=True,
-            text=True,
-            timeout=300
-        )
-        return result.returncode == 0, result.stdout, result.stderr
-    except subprocess.TimeoutExpired:
-        return False, "", "Maven package timed out after 5 minutes"
-    except Exception as e:
-        return False, "", f"Maven package failed with exception: {str(e)}"
-
-def extract_build_errors(output: str) -> List[Dict]:
-    """
-    Extract meaningful build errors from Maven output (stdout + stderr)
-    """
-    errors = []
-    # Compilation errors
-    compilation_pattern = r'\[ERROR\] (.+\.java):\[(\d+),(\d+)\] (.+)'
-    compilation_matches = re.findall(compilation_pattern, output)
-    for match in compilation_matches:
-        file_path, line, column, error_msg = match
-        errors.append({
-            "type": "compilation",
-            "file": file_path,
-            "line": int(line),
-            "column": int(column),
-            "message": error_msg.strip()
-        })
-    # Dependency issues
-    dependency_pattern = r'\[ERROR\] (.+\.jar) was not found'
-    dependency_matches = re.findall(dependency_pattern, output)
-    for match in dependency_matches:
-        errors.append({
-            "type": "dependency",
-            "message": f"Missing dependency: {match}"
-        })
-    # General Maven errors
-    general_error_pattern = r'\[ERROR\] (.+)'
-    general_matches = re.findall(general_error_pattern, output)
-    for match in general_matches:
-        if match not in [error.get("message", "") for error in errors]:
-            errors.append({
-                "type": "general",
-                "message": match.strip()
-            })
-    return errors
-
-def get_file_content(file_path: str, code_dir: str) -> Optional[str]:
-    """
-    Get the content of a specific file
-    """
-    try:
-        # Use file_path as is if absolute, else join with code_dir
-        if os.path.isabs(file_path):
-            full_path = file_path
-        else:
-            full_path = os.path.join(code_dir, file_path)
-        with open(full_path, 'r', encoding='utf-8') as f:
-            return f.read()
-    except Exception as e:
-        print(f"Could not read file {file_path}: {e}")
-        return None
-
-def fix_build_errors(errors: List[Dict], code_dir: str) -> List[Dict]:
-    """
-    Use LLM to fix build errors and return the fixes
-    """
-    if not errors:
-        return []
+    source_files = []
     
-    llm = ChatGoogleGenerativeAI(model=GEMINI_MODEL, google_api_key=GEMINI_API_KEY)
+    for root, dirs, files in os.walk(repo_dir):
+        for file in files:
+            if file.endswith('.java') and 'src/main/java' in root:
+                file_path = os.path.join(root, file)
+                try:
+                    with open(file_path, "r", encoding="utf-8") as f:
+                        content = f.read()
+                        rel_path = os.path.relpath(file_path, repo_dir)
+                        source_files.append(f"// SOURCE FILE: {rel_path}\n{content}")
+                except Exception as e:
+                    print(f"Could not read {file_path}: {e}")
     
-    # Collect relevant file contents
-    files_to_fix = set()
-    for error in errors:
-        if error.get("file"):
-            files_to_fix.add(error["file"])
+    # Also include pom.xml for dependency analysis
+    pom_path = os.path.join(repo_dir, "pom.xml")
+    if os.path.exists(pom_path):
+        try:
+            with open(pom_path, "r", encoding="utf-8") as f:
+                pom_content = f.read()
+                source_files.append(f"// POM FILE: pom.xml\n{pom_content}")
+        except Exception as e:
+            print(f"Could not read pom.xml: {e}")
     
-    file_contents = {}
-    for file_path in files_to_fix:
-        content = get_file_content(file_path, code_dir)
-        if content:
-            file_contents[file_path] = content
-    
-    # Create error summary
-    error_summary = "\n".join([
-        f"- {error['type']}: {error.get('file', 'N/A')}:{error.get('line', 'N/A')} - {error['message']}"
-        for error in errors
-    ])
-    
-    # Create file content summary
-    files_summary = ""
-    for file_path, content in file_contents.items():
-        files_summary += f"\n// FILE: {file_path}\n{content}\n"
-    
-    prompt = (
-        "You are an expert Java developer. The Maven build step is failing with the following errors:\n\n"
-        f"{error_summary}\n\n"
-        "Here are the relevant files that need to be fixed:\n"
-        f"{files_summary}\n\n"
-        "Please fix these build errors. Return ONLY a JSON response with the following format:\n\n"
-        "{\n"
-        "  \"files\": [\n"
-        "    {\n"
-        "      \"path\": \"src/main/java/com/example/Foo.java\",\n"
-        "      \"action\": \"update\",\n"
-        "      \"content\": \"...fixed code...\"\n"
-        "    }\n"
-        "  ]\n"
-        "}\n\n"
-        "IMPORTANT: Always use RELATIVE paths for the 'path' field (relative to the project root). Never use absolute paths.\n"
-        "Focus on:\n"
-        "1. Fixing compilation errors (missing imports, syntax errors, etc.)\n"
-        "2. Resolving dependency issues in pom.xml\n"
-        "3. Ensuring code compiles and runs successfully\n"
-        "DO NOT return markdown, comments, or explanations. Only return the JSON."
+    return "\n\n".join(source_files)
+
+
+def generate_comprehensive_tests(source_code: str, config: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """
+    Generate comprehensive JUnit tests with maximum JaCoCo coverage.
+    """
+    llm = ChatGoogleGenerativeAI(
+        model=config["gemini"]["model"], 
+        google_api_key=config["gemini"]["api_key"]
     )
     
+    prompt = f"""
+You are an expert Java testing engineer specializing in JUnit 5 and maximum code coverage. 
+Your task is to generate comprehensive JUnit tests for the modernized Java application.
+
+**REQUIREMENTS:**
+1. **Maximum Coverage**: Aim for 95%+ JaCoCo code coverage
+2. **JUnit 5**: Use latest JUnit 5 features (assertions, parameterized tests, etc.)
+3. **Test All Scenarios**: Happy path, edge cases, error conditions, boundary values
+4. **Mocking**: Use Mockito for external dependencies
+5. **Test Organization**: Follow AAA pattern (Arrange, Act, Assert)
+6. **Naming**: Clear, descriptive test method names
+7. **Coverage**: Test all public methods, constructors, and important private logic
+
+**TESTING STRATEGIES:**
+- **Unit Tests**: Test individual classes and methods
+- **Integration Tests**: Test component interactions
+- **Exception Testing**: Test error conditions and edge cases
+- **Parameterized Tests**: Test multiple input combinations
+- **Mock Testing**: Mock external dependencies (databases, APIs, etc.)
+- **Boundary Testing**: Test limits, null values, empty collections
+- **State Testing**: Verify object state changes
+
+**COVERAGE TARGETS:**
+- **Line Coverage**: 95%+
+- **Branch Coverage**: 90%+
+- **Method Coverage**: 100%
+- **Class Coverage**: 100%
+
+**DEPENDENCIES TO INCLUDE:**
+```xml
+<dependency>
+    <groupId>org.junit.jupiter</groupId>
+    <artifactId>junit-jupiter</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.mockito</groupId>
+    <artifactId>mockito-core</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.mockito</groupId>
+    <artifactId>mockito-junit-jupiter</artifactId>
+    <scope>test</scope>
+</dependency>
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-test</artifactId>
+    <scope>test</scope>
+</dependency>
+```
+
+**SOURCE CODE TO TEST:**
+{source_code}
+
+**INSTRUCTIONS:**
+Analyze the source code and generate comprehensive JUnit tests. Return ONLY a JSON response with the following format:
+
+{{
+  "test_files": [
+    {{
+      "path": "src/test/java/com/example/ControllerTest.java",
+      "action": "create",
+      "content": "// Complete JUnit test file content here"
+    }}
+  ],
+  "pom_updates": [
+    {{
+      "path": "pom.xml",
+      "action": "update",
+      "content": "// Updated pom.xml with test dependencies"
+    }}
+  ]
+}}
+
+**IMPORTANT:**
+- Generate tests for EVERY public class and method
+- Include tests for edge cases and error conditions
+- Use modern JUnit 5 features and best practices
+- Ensure maximum code coverage possible
+- Test both positive and negative scenarios
+- Mock external dependencies appropriately
+- Follow Java testing conventions and naming
+
+Return ONLY the JSON response, no explanations or markdown.
+"""
+
     try:
         response = llm.invoke(prompt)
-        raw_output = str(response.content).strip()
+        raw_output = response.content
         
-        # Clean up the response
+        if isinstance(raw_output, str):
+            raw_output = raw_output.strip()
+        else:
+            raw_output = str(raw_output).strip()
+
+        # Clean up markdown formatting
         if raw_output.startswith("```json"):
             raw_output = raw_output.lstrip("```json").rstrip("```").strip()
         elif raw_output.startswith("```"):
             raw_output = raw_output.lstrip("```").rstrip("```").strip()
-        
+
+        # Parse JSON response
         parsed = json.loads(raw_output)
-        return parsed.get("files", [])
+        
+        # Combine test files and pom updates
+        all_files = []
+        if "test_files" in parsed:
+            all_files.extend(parsed["test_files"])
+        if "pom_updates" in parsed:
+            all_files.extend(parsed["pom_updates"])
+        
+        return all_files
         
     except Exception as e:
-        print(f"❌ Failed to get fixes from LLM: {e}")
+        print(f"❌ Error generating tests: {e}")
         return []
 
-def apply_fixes(fixes: List[Dict], code_dir: str) -> bool:
+
+def run_jacoco_coverage_check(repo_dir: str) -> Tuple[bool, str, Dict[str, Any]]:
     """
-    Apply the fixes returned by the LLM
+    Run JaCoCo coverage analysis and return results.
     """
-    if not fixes:
-        return False
+    import subprocess
+    import xml.etree.ElementTree as ET
     
     try:
-        for fix in fixes:
-            file_path = os.path.normpath(fix["path"])
-            # Handle absolute/relative paths
-            if not os.path.isabs(file_path):
-                full_path = os.path.abspath(os.path.join(code_dir, file_path))
-            else:
-                full_path = file_path
-            # Ensure file is within project
-            if not full_path.startswith(os.path.abspath(code_dir)):
-                print(f"❌ Refusing to write outside project: {full_path}")
-                continue
-            # Backup before overwrite
-            if os.path.exists(full_path) and fix["action"] in ("update", "delete"):
-                shutil.copy2(full_path, full_path + ".bak")
-            action = fix["action"]
-            content = fix.get("content", "")
-            
-            if action == "update":
-                with open(full_path, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                print(f"✅ Updated {file_path}")
-            elif action == "create":
-                os.makedirs(os.path.dirname(full_path), exist_ok=True)
-                with open(full_path, 'w', encoding='utf-8') as f:
-                    f.write(content)
-                print(f"✅ Created {file_path}")
-            elif action == "delete":
-                if os.path.exists(full_path):
-                    os.remove(full_path)
-                    print(f"✅ Deleted {file_path}")
+        print("🧪 Running JaCoCo coverage analysis...")
         
-        return True
+        # First, run tests
+        print("🔍 Running JUnit tests...")
+        
+        # Use mvn.cmd on Windows, mvn on other platforms
+        import platform
+        mvn_command = "mvn.cmd" if platform.system() == "Windows" else "mvn"
+        
+        test_result = subprocess.run(
+            [mvn_command, "clean", "test", "jacoco:report"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=300
+        )
+        
+        if test_result.returncode != 0:
+            return False, "Tests failed", {
+                "test_output": test_result.stdout + test_result.stderr,
+                "coverage": None
+            }
+        
+        print("✅ Tests passed, analyzing coverage...")
+        
+        # Parse JaCoCo report
+        jacoco_report_path = os.path.join(repo_dir, "target", "site", "jacoco", "index.html")
+        if not os.path.exists(jacoco_report_path):
+            return False, "JaCoCo report not found", {
+                "test_output": test_result.stdout,
+                "coverage": None
+            }
+        
+        # Parse XML report for detailed coverage
+        xml_report_path = os.path.join(repo_dir, "target", "site", "jacoco", "jacoco.xml")
+        coverage_data = {}
+        
+        if os.path.exists(xml_report_path):
+            try:
+                tree = ET.parse(xml_report_path)
+                root = tree.getroot()
+                
+                # Extract coverage metrics
+                for counter in root.findall(".//counter"):
+                    counter_type = counter.get("type")
+                    covered = int(counter.get("covered", 0))
+                    missed = int(counter.get("missed", 0))
+                    total = covered + missed
+                    
+                    if total > 0:
+                        percentage = (covered / total) * 100
+                        coverage_data[counter_type] = {
+                            "covered": covered,
+                            "missed": missed,
+                            "total": total,
+                            "percentage": round(percentage, 2)
+                        }
+                
+                print("📊 Coverage Analysis Complete")
+                for metric, data in coverage_data.items():
+                    print(f"  {metric}: {data['percentage']}% ({data['covered']}/{data['total']})")
+                
+            except Exception as e:
+                print(f"⚠️ Could not parse XML report: {e}")
+        
+        return True, "Coverage analysis complete", {
+            "test_output": test_result.stdout,
+            "coverage": coverage_data,
+            "report_url": jacoco_report_path
+        }
+        
+    except subprocess.TimeoutExpired:
+        return False, "Tests timed out", {"coverage": None}
     except Exception as e:
-        print(f"❌ Failed to apply fixes: {e}")
-        return False
+        return False, f"Coverage check failed: {e}", {"coverage": None}
 
-def fix_and_build(code_dir: str, max_attempts: int = 3, on_success: Optional[Callable]=None) -> tuple[bool, str]:
+
+def generate_test_coverage_report(coverage_data: Dict[str, Any]) -> str:
     """
-    Try to build with 'mvn clean compile', then 'mvn package', auto-fix with LLM if either fails, and call on_success if both pass.
-    Returns (success, build_output)
+    Generate a human-readable coverage report.
     """
-    if not check_maven_available():
-        return False, "Maven is not available in the system PATH. Please install Maven and ensure it's in your PATH."
-    for attempt in range(max_attempts):
-        print(f"\n📋 Attempt {attempt + 1}/{max_attempts}")
-        build_success, stdout, stderr = run_maven_compile(code_dir)
-        output = stdout + "\n" + stderr
-        if build_success:
-            print("✅ Build (mvn clean compile) successful!")
-            # Run mvn package after successful build
-            package_success, package_stdout, package_stderr = run_maven_package(code_dir)
-            package_output = package_stdout + "\n" + package_stderr
-            if package_success:
-                print("✅ Maven package successful!")
-                if on_success:
-                    on_success()
-                return True, output + "\n" + package_output
-            else:
-                print("❌ Maven package failed. Parsing errors and sending to LLM...")
-                errors = extract_build_errors(package_output)
-                if errors:
-                    fixes = fix_build_errors(errors, code_dir)
-                    if fixes:
-                        print(f"🔧 Applying {len(fixes)} fixes for package errors...")
-                        if apply_fixes(fixes, code_dir):
-                            print("✅ Fixes applied. Retrying build and package...")
-                            continue
-                        else:
-                            print("❌ Failed to apply fixes for package errors. Retrying build and package anyway...")
-                            continue
-                    else:
-                        print("❌ LLM did not generate fixes for package errors. Retrying build and package anyway...")
-                        continue
-                else:
-                    print("❌ Could not extract specific package errors. Retrying build and package anyway...")
-                    continue
+    if not coverage_data:
+        return "No coverage data available"
+    
+    report_lines = ["📊 **JaCoCo Code Coverage Report**\n"]
+    
+    for metric, data in coverage_data.items():
+        percentage = data['percentage']
+        covered = data['covered']
+        total = data['total']
+        
+        # Add emoji based on coverage level
+        if percentage >= 90:
+            emoji = "🟢"
+        elif percentage >= 80:
+            emoji = "🟡"
+        elif percentage >= 70:
+            emoji = "🟠"
         else:
-            print("❌ Build failed. Parsing errors and sending to LLM...")
-            errors = extract_build_errors(output)
-            if errors:
-                fixes = fix_build_errors(errors, code_dir)
-                if fixes:
-                    print(f"🔧 Applying {len(fixes)} fixes...")
-                    if apply_fixes(fixes, code_dir):
-                        print("✅ Fixes applied. Retrying build...")
-                        continue
-                    else:
-                        print("❌ Failed to apply fixes. Retrying build anyway...")
-                        continue
-                else:
-                    print("❌ LLM did not generate fixes. Retrying build anyway...")
-                    continue
-            else:
-                print("❌ Could not extract specific build errors. Retrying build anyway...")
-                continue
-    print("❌ Build or package failed after max attempts.")
-    return False, output
+            emoji = "🔴"
+        
+        report_lines.append(f"{emoji} **{metric.title()}**: {percentage}% ({covered}/{total})")
+    
+    # Calculate overall coverage
+    total_covered = sum(data['covered'] for data in coverage_data.values())
+    total_lines = sum(data['total'] for data in coverage_data.values())
+    
+    if total_lines > 0:
+        overall_coverage = (total_covered / total_lines) * 100
+        overall_emoji = "🟢" if overall_coverage >= 90 else "🟡" if overall_coverage >= 80 else "🟠" if overall_coverage >= 70 else "🔴"
+        report_lines.append(f"\n{overall_emoji} **Overall Coverage**: {overall_coverage:.1f}%")
+    
+    return "\n".join(report_lines)
 
-def deploy_and_check_health(artifact_path):
-    import shutil, subprocess, time, requests, os
-    endpoint_url = None
-    deployment_type = None
-    health_ok = False
-    log_file_path = os.path.join(os.path.dirname(artifact_path), "deployment.log")
-    health_url_found = None
 
-    if artifact_path:
-        if artifact_path.endswith('.war'):
-            # Deploy WAR to Tomcat
-            tomcat_webapps = '/usr/local/tomcat/webapps'
-            artifact_name = os.path.splitext(os.path.basename(artifact_path))[0]
-            deployed_path = os.path.join(tomcat_webapps, os.path.basename(artifact_path))
-            try:
-                shutil.copy2(artifact_path, deployed_path)
-                deployment_type = 'war'
-                endpoint_url = f'http://localhost:8080/{artifact_name}/'
-                # Optionally restart Tomcat here if needed
-            except Exception as e:
-                print(f'Failed to deploy WAR: {e}')
-        elif artifact_path.endswith('.jar'):
-            # Run JAR in background and log output
-            try:
-                with open(log_file_path, "w") as log_file:
-                    subprocess.Popen(['java', '-jar', artifact_path, '--server.port=8080'], stdout=log_file, stderr=subprocess.STDOUT)
-                deployment_type = 'jar'
-                endpoint_url = 'http://localhost:8080/'
-            except Exception as e:
-                print(f'Failed to run JAR: {e}')
-                with open(log_file_path, "a") as log_file:
-                    log_file.write(f"\nFailed to start JAR process: {e}")
-
-    # --- Health check logic ---
-    if endpoint_url:
-        # Check both /actuator/health and /health
-        health_endpoints = ['/actuator/health', '/health']
-        print(f"Waiting for application to start at {endpoint_url}...")
-        for _ in range(30):  # Wait up to 30 seconds
-            for endpoint in health_endpoints:
-                health_url = endpoint_url.rstrip('/') + endpoint
-                try:
-                    resp = requests.get(health_url, timeout=2)
-                    if resp.status_code == 200:
-                        health_ok = True
-                        health_url_found = health_url
-                        print(f"✅ Health check passed at: {health_url_found}")
-                        break
-                except requests.exceptions.RequestException:
-                    pass
-            if health_ok:
-                break
-            time.sleep(1)
-
-        if not health_ok:
-            print("❌ Health check failed. Application did not become healthy in 30 seconds.")
-            print(f"Deployment logs can be found in: {log_file_path}")
-            try:
-                with open(log_file_path, "r") as log_file:
-                    print("--- Deployment Log ---")
-                    print(log_file.read())
-                    print("----------------------")
-            except Exception as e:
-                print(f"Could not read deployment log file: {e}")
-
-    return endpoint_url, health_ok, health_url_found
-
-def build_and_deploy(code_dir, max_attempts=3, on_success=None):
-    build_success, build_output = fix_and_build(code_dir, max_attempts, on_success)
-    endpoint_url, health_ok, health_url = (None, False, None)
-    if build_success:
-        artifact_path = None
-        target_dir = os.path.join(code_dir, 'target')
-        if os.path.isdir(target_dir):
-            for file in os.listdir(target_dir):
-                if file.endswith('.jar') or file.endswith('.war'):
-                    artifact_path = os.path.join(target_dir, file)
-                    break
-        if artifact_path:
-            endpoint_url, health_ok, health_url = deploy_and_check_health(artifact_path)
-        else:
-            print("❌ No artifact found to deploy.")
-    return build_success, build_output, endpoint_url, health_ok, health_url
+def create_test_agent_workflow(repo_dir: str) -> Tuple[bool, str, Dict[str, Any]]:
+    """
+    Main workflow for Agent 3: Generate tests and check coverage.
+    """
+    try:
+        config = load_config()
+        
+        print("🧪 Agent 3: Starting comprehensive test generation...")
+        
+        # Step 1: Get source code for testing
+        print("📖 Analyzing source code for test generation...")
+        source_code = get_source_files_for_testing(repo_dir)
+        
+        if not source_code:
+            return False, "No source code found for testing", {}
+        
+        # Step 2: Generate comprehensive tests
+        print("✍️ Generating comprehensive JUnit tests...")
+        test_files = generate_comprehensive_tests(source_code, config)
+        
+        if not test_files:
+            return False, "Failed to generate tests", {}
+        
+        print(f"✅ Generated {len(test_files)} test files")
+        
+        # Step 3: Apply test files to repository
+        print("💾 Applying test files to repository...")
+        from utils.file_ops import apply_structured_changes
+        apply_structured_changes(test_files, repo_dir)
+        
+        # Step 4: Run tests and check coverage
+        print("🔍 Running tests and analyzing coverage...")
+        success, message, coverage_info = run_jacoco_coverage_check(repo_dir)
+        
+        if not success:
+            return False, f"Coverage check failed: {message}", coverage_info
+        
+        # Step 5: Generate coverage report
+        coverage_report = generate_test_coverage_report(coverage_info.get("coverage", {}))
+        
+        return True, "Test generation and coverage analysis complete", {
+            "test_files": test_files,
+            "coverage_data": coverage_info.get("coverage", {}),
+            "coverage_report": coverage_report,
+            "report_url": coverage_info.get("report_url"),
+            "test_output": coverage_info.get("test_output", "")
+        }
+        
+    except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"❌ Agent 3 workflow failed: {e}")
+        print(f"Traceback: {error_details}")
+        return False, f"Test generation failed: {e}", {"error_details": error_details}
