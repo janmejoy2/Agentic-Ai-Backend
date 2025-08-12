@@ -24,28 +24,51 @@ CORS(app)
 setup_cleanup_handlers()
 
 
-def render_plantuml_to_png(plantuml_code, output_dir="diagrams"):
-    os.makedirs(output_dir, exist_ok=True)
-    unique_id = str(uuid.uuid4())
-    png_path = os.path.join(output_dir, f"diagram_{unique_id}.png")
-    # Ensure PlantUML code has @startuml/@enduml
-    code = plantuml_code.strip()
-    if not code.startswith("@startuml"):
-        code = "@startuml\n" + code
-    if not code.endswith("@enduml"):
-        code = code + "\n@enduml"
-    # Write to a temp .puml file
-    puml_path = os.path.join(output_dir, f"diagram_{unique_id}.puml")
-    with open(puml_path, "w", encoding="utf-8") as f:
-        f.write(code)
-    # Render using PlantUML server (default public server)
-    server = PlantUML(url="http://www.plantuml.com/plantuml/img/")
+def render_plantuml_to_png(plantuml_code, config=None, output_dir="diagrams"):
+    """Render PlantUML code to PNG with improved error handling"""
     try:
-        server.processes_file(puml_path, png_path)
-    except PlantUMLHTTPError as e:
-        print(f"PlantUMLHTTPError occurred: {e}")
+        os.makedirs(output_dir, exist_ok=True)
+        unique_id = str(uuid.uuid4())
+        png_path = os.path.join(output_dir, f"diagram_{unique_id}.png")
+        
+        # Ensure PlantUML code has @startuml/@enduml
+        code = plantuml_code.strip()
+        if not code.startswith("@startuml"):
+            code = "@startuml\n" + code
+        if not code.endswith("@enduml"):
+            code = code + "\n@enduml"
+        
+        # Write to a temp .puml file
+        puml_path = os.path.join(output_dir, f"diagram_{unique_id}.puml")
+        with open(puml_path, "w", encoding="utf-8") as f:
+            f.write(code)
+        
+        # Render using PlantUML server from configuration
+        if config:
+            server_url = config.get("plantuml", {}).get("server_url", "http://www.plantuml.com/plantuml/img/")
+        else:
+            server_url = "http://www.plantuml.com/plantuml/img/"
+        server = PlantUML(url=server_url)
+        try:
+            server.processes_file(puml_path, png_path)
+            return png_path
+        except PlantUMLHTTPError as e:
+            # Handle different versions of PlantUML library
+            error_msg = str(e)
+            if hasattr(e, 'message'):
+                error_msg = e.message
+            elif hasattr(e, 'response'):
+                error_msg = f"HTTP {e.response.status_code}: {e.response.text}"
+            
+            print(f"PlantUMLHTTPError occurred: {error_msg}")
+            return None
+        except Exception as e:
+            print(f"PlantUML rendering failed: {str(e)}")
+            return None
+            
+    except Exception as e:
+        print(f"PlantUML diagram generation failed: {str(e)}")
         return None
-    return png_path
 
 
 # Validates the incoming request data for the modernize_project endpoint. Returns (error_response, user_req, repo_path) tuple.
@@ -129,11 +152,19 @@ def modernize_project():
                 mr_description
             )
 
-            # Generate PlantUML diagram for the modernized codebase
-            code_files = get_code_files_for_summary(config["repository"]["local_dir"])
-            code_snapshot = "\n\n".join(code_files)
-            plantuml_result = generate_plantuml_diagram(code_snapshot, config)
-            png_path = render_plantuml_to_png(plantuml_result)
+            # Generate PlantUML diagram for the modernized codebase (optional)
+            png_path = None
+            if config.get("plantuml", {}).get("enabled", True):
+                try:
+                    code_files = get_code_files_for_summary(config["repository"]["local_dir"])
+                    code_snapshot = "\n\n".join(code_files)
+                    plantuml_result = generate_plantuml_diagram(code_snapshot, config)
+                    png_path = render_plantuml_to_png(plantuml_result, config)
+                except Exception as e:
+                    print(f"PlantUML diagram generation failed (non-critical): {str(e)}")
+                    # Continue without diagram - this is not critical for the main workflow
+            else:
+                print("PlantUML diagram generation disabled in configuration")
 
             return jsonify({
                 'success': True,
@@ -183,11 +214,19 @@ def generate_tests_for_project():
         test_state = test_workflow.invoke({"project_path": config["repository"]["local_dir"]})
 
         if test_state.get('success'):
-            # Generate PlantUML diagram for the codebase with tests
-            code_files = get_code_files_for_summary(config["repository"]["local_dir"])
-            code_snapshot = "\n\n".join(code_files)
-            plantuml_result = generate_plantuml_diagram(code_snapshot, config)
-            png_path = render_plantuml_to_png(plantuml_result)
+            # Generate PlantUML diagram for the codebase with tests (optional)
+            png_path = None
+            if config.get("plantuml", {}).get("enabled", True):
+                try:
+                    code_files = get_code_files_for_summary(config["repository"]["local_dir"])
+                    code_snapshot = "\n\n".join(code_files)
+                    plantuml_result = generate_plantuml_diagram(code_snapshot, config)
+                    png_path = render_plantuml_to_png(plantuml_result, config)
+                except Exception as e:
+                    print(f"PlantUML diagram generation failed (non-critical): {str(e)}")
+                    # Continue without diagram - this is not critical for the main workflow
+            else:
+                print("PlantUML diagram generation disabled in configuration")
 
             return jsonify({
                 'success': True,
@@ -274,29 +313,43 @@ def generate_gemini_summary(code_snapshot, config):
 
 def generate_plantuml_diagram(code_snapshot, config):
     """Generates a PlantUML diagram of the codebase architecture."""
-    from langchain_google_genai import ChatGoogleGenerativeAI
-    llm = ChatGoogleGenerativeAI(
-        model=config["gemini"]["model"],
-        google_api_key=config["gemini"]["api_key"],
-        temperature=0.1
-    )
-    
-    prompt = f"""
-    Analyze the following codebase and generate a PlantUML class diagram showing the main components, classes, and their relationships.
-    Focus on:
-    - Main classes and their methods
-    - Relationships between classes (inheritance, composition, association)
-    - Key interfaces and abstract classes
-    - Package structure if applicable
-    
-    Codebase:
-    {code_snapshot}
-    
-    Generate only the PlantUML diagram code (without @startuml/@enduml tags).
-    """
-    
-    response = llm.invoke(prompt)
-    return response.content
+    try:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        llm = ChatGoogleGenerativeAI(
+            model=config["gemini"]["model"],
+            google_api_key=config["gemini"]["api_key"],
+            temperature=0.1
+        )
+        
+        prompt = f"""
+        Analyze the following codebase and generate a PlantUML class diagram showing the main components, classes, and their relationships.
+        Focus on:
+        - Main classes and their methods
+        - Relationships between classes (inheritance, composition, association)
+        - Key interfaces and abstract classes
+        - Package structure if applicable
+        
+        Codebase:
+        {code_snapshot}
+        
+        Generate only the PlantUML diagram code (without @startuml/@enduml tags).
+        """
+        
+        response = llm.invoke(prompt)
+        return response.content
+    except Exception as e:
+        print(f"PlantUML diagram generation failed: {str(e)}")
+        # Return a simple fallback diagram
+        return """
+        @startuml
+        class Codebase {
+            + main components
+            + classes
+            + relationships
+        }
+        note right of Codebase : Diagram generation failed
+        @enduml
+        """
 
 
 @app.route('/summarize', methods=['POST'])
@@ -325,9 +378,17 @@ def summarize_project():
         # Generate summary
         summary = generate_gemini_summary(code_snapshot, config)
 
-        # Generate PlantUML diagram
-        plantuml_result = generate_plantuml_diagram(code_snapshot, config)
-        png_path = render_plantuml_to_png(plantuml_result)
+        # Generate PlantUML diagram (optional)
+        png_path = None
+        if config.get("plantuml", {}).get("enabled", True):
+            try:
+                plantuml_result = generate_plantuml_diagram(code_snapshot, config)
+                png_path = render_plantuml_to_png(plantuml_result, config)
+            except Exception as e:
+                print(f"PlantUML diagram generation failed (non-critical): {str(e)}")
+                # Continue without diagram - this is not critical for the main workflow
+        else:
+            print("PlantUML diagram generation disabled in configuration")
 
         return jsonify({
             'summary': summary,

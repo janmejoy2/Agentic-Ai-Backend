@@ -467,8 +467,17 @@ def create_build_deploy_agent_workflow(code_dir: str) -> Tuple[bool, str, dict]:
         
         success, output, endpoint_url, health_ok, actuator_health_url = build_and_deploy(code_dir)
         
+        # Add retry information to the output
+        retry_info = f"\n\n--- Build Summary ---\n"
+        retry_info += f"Build Status: {'✅ SUCCESS' if success else '❌ FAILED'}\n"
+        if not success:
+            retry_info += f"Note: This build failure may trigger recoding with Agent 2 if retry mechanism is enabled.\n"
+        retry_info += f"Endpoint URL: {endpoint_url or 'N/A'}\n"
+        retry_info += f"Health Check: {'✅ PASSED' if health_ok else '❌ FAILED'}\n"
+        retry_info += f"Actuator Health URL: {actuator_health_url or 'N/A'}\n"
+        
         return success, "Build and deployment completed", {
-            "build_output": output,
+            "build_output": output + retry_info,
             "endpoint_url": endpoint_url,
             "endpoint_health": health_ok,
             "actuator_health_url": actuator_health_url

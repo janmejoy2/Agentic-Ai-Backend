@@ -2,14 +2,14 @@
 
 # Gemini API Configuration
 gemini:
-  api_key: "AIzaSyCwLbtLUJ1hUMwzGpIzeF0TvKwMlB9Ar3Q"
+  api_key: ""
   model: "gemini-1.5-flash"
 
 # GitLab Configuration
 gitlab:
   url: "https://gitlab.com"
   repo_path: "janmejoyparida/employeeapi"  # This will be updated dynamically
-  private_token: "glpat-dYJRiXC2VHQnK77spquE"
+  private_token: ""
   default_branch: "main"
 
 # Local Repository Configuration
@@ -20,6 +20,17 @@ repository:
 agents:
   skip_test_generation: true  # Set to true to skip Agent 3 (test generation)
   skip_build_deploy: false     # Set to true to skip Agent 4 (build & deploy)
+
+# Retry Configuration
+retry:
+  max_build_attempts: 3        # Maximum number of build attempts before triggering recoding
+  max_recode_attempts: 2       # Maximum number of recoding attempts
+  enable_auto_recode: true     # Enable automatic recoding when build fails
+
+# PlantUML Configuration
+plantuml:
+  enabled: false               # Set to false to disable PlantUML diagram generation
+  server_url: "http://www.plantuml.com/plantuml/img/"  # PlantUML server URL
 
 # Cleanup Configuration
 cleanup:
